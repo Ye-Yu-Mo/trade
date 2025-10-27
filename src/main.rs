@@ -5,6 +5,7 @@ mod llm;
 mod logging;
 mod market;
 mod multi_agent;
+mod performance;
 mod state;
 mod types;
 
@@ -13,6 +14,7 @@ use chrono::{DateTime, Utc};
 use dotenvy::dotenv;
 use futures::future::try_join_all;
 use log::{error, info, warn};
+use performance::PerformanceTracker;
 use std::env;
 use tokio::time::{interval, Duration};
 
@@ -21,6 +23,7 @@ struct SymbolCycleResult {
     traded: bool, // 是否执行了交易
     account_snapshot: Option<executor::AccountInfo>,
     position_snapshot: Option<types::Position>,
+    trade_result: Option<types::TradeResult>,
 }
 
 // 并行分析产物
@@ -381,6 +384,7 @@ async fn execute_symbol_cycle(
     let mut traded = false;
     let mut account_snapshot = Some(account.clone());
     let mut position_snapshot = analysis.position.clone();
+    let mut latest_trade_result = None;
 
     if decision.signal != types::Signal::Hold {
         let raw_price = market::fetch_current_price(&analysis.symbol).await?;
@@ -405,6 +409,7 @@ async fn execute_symbol_cycle(
                     traded: false,
                     account_snapshot: Some(account.clone()),
                     position_snapshot: analysis.position.clone(),
+                    trade_result: None,
                 });
             }
         };
@@ -431,6 +436,7 @@ async fn execute_symbol_cycle(
             Ok(result) => {
                 traded = !matches!(result.action, types::TradeAction::Hold);
 
+                let trade_record = result.clone();
                 info!(
                     "交易执行: {:?}, 价格: {:.2}, 数量: {:.4}",
                     result.action, result.price, result.amount
@@ -441,7 +447,8 @@ async fn execute_symbol_cycle(
                 if let Some(pnl) = result.pnl {
                     info!("平仓盈亏: {:.2} USDT", pnl);
                 }
-                state::log_trade(&result)?;
+                state::log_trade(&trade_record)?;
+                latest_trade_result = Some(trade_record);
 
                 if traded {
                     account_snapshot =
@@ -471,6 +478,7 @@ async fn execute_symbol_cycle(
                     order_details: Some(format!("ERROR: {:#}", e)),
                 };
                 state::log_trade(&failed_result)?;
+                latest_trade_result = Some(failed_result);
             }
         }
     } else {
@@ -481,6 +489,7 @@ async fn execute_symbol_cycle(
         traded,
         account_snapshot,
         position_snapshot,
+        trade_result: latest_trade_result,
     })
 }
 
@@ -491,6 +500,7 @@ async fn run_portfolio_cycle(
     constraints_map: &std::collections::HashMap<String, executor::SymbolConstraints>,
     symbols_cache: &mut std::collections::HashMap<String, SymbolCacheEntry>,
     account_cache: &mut Option<AccountCache>,
+    performance_tracker: &mut PerformanceTracker,
 ) -> Result<bool> {
     info!("============================================================");
     info!(
@@ -658,11 +668,18 @@ async fn run_portfolio_cycle(
         .await
         {
             Ok(result) => {
-                if result.traded {
+                let SymbolCycleResult {
+                    traded: cycle_traded,
+                    account_snapshot,
+                    position_snapshot,
+                    trade_result,
+                } = result;
+
+                if cycle_traded {
                     any_traded = true;
                 }
 
-                if let Some(snapshot) = result.account_snapshot.clone() {
+                if let Some(snapshot) = account_snapshot {
                     current_account = snapshot;
                     match account_cache {
                         Some(cache) => cache.update(current_account.clone()),
@@ -670,8 +687,13 @@ async fn run_portfolio_cycle(
                     }
                 }
 
-                let cached_position = result
-                    .position_snapshot
+                if let Some(trade) = trade_result.as_ref() {
+                    if performance_tracker.update(trade) {
+                        performance_tracker.persist()?;
+                    }
+                }
+
+                let cached_position = position_snapshot
                     .clone()
                     .or_else(|| analysis.position.clone());
 
@@ -830,6 +852,7 @@ async fn main() -> Result<()> {
     let mut symbols_cache: std::collections::HashMap<String, SymbolCacheEntry> =
         std::collections::HashMap::new();
     let mut account_cache: Option<AccountCache> = None;
+    let mut performance_tracker = PerformanceTracker::new();
 
     // 主循环
     let mut ticker = interval(Duration::from_secs(config.trade_interval_secs));
@@ -843,6 +866,7 @@ async fn main() -> Result<()> {
             &symbol_constraints,
             &mut symbols_cache,
             &mut account_cache,
+            &mut performance_tracker,
         )
         .await
         {

@@ -2,6 +2,7 @@
 
 mod executor;
 mod llm;
+mod logging;
 mod market;
 mod multi_agent;
 mod state;
@@ -9,12 +10,98 @@ mod types;
 
 use anyhow::{Context, Result};
 use dotenvy::dotenv;
+use futures::future::{join_all, try_join_all};
+use log::{error, info, warn};
 use std::env;
 use tokio::time::{interval, Duration};
 
-// 交易周期结果
-struct CycleResult {
-    traded: bool,  // 是否执行了交易
+// 并行分析后的执行结果
+struct SymbolCycleResult {
+    traded: bool, // 是否执行了交易
+    account_snapshot: Option<executor::AccountInfo>,
+    position_snapshot: Option<types::Position>,
+}
+
+// 并行分析产物
+struct SymbolAnalysis {
+    symbol: String,
+    position: Option<types::Position>,
+    market_report: types::MarketReport,
+}
+
+fn adjust_trade_quantity(
+    desired: f64,
+    allocated_max: f64,
+    allocated_balance: f64,
+    price: f64,
+    constraints: &executor::SymbolConstraints,
+) -> Option<f64> {
+    if allocated_max <= 0.0 {
+        return None;
+    }
+
+    let mut effective_max = allocated_max;
+    if allocated_balance > 0.0 && price > 0.0 {
+        let balance_limit = allocated_balance / price;
+        if balance_limit > 0.0 {
+            effective_max = effective_max.min(balance_limit);
+        }
+    }
+
+    let mut qty = desired.max(0.0);
+    if qty == 0.0 {
+        qty = constraints.min_qty.max(constraints.step_size);
+    }
+
+    if qty > effective_max {
+        qty = effective_max;
+    }
+
+    qty = executor::quantize_down(qty, constraints.step_size);
+
+    if qty < constraints.min_qty {
+        qty = executor::quantize_up(constraints.min_qty, constraints.step_size);
+    }
+
+    if let Some(max_qty) = constraints.max_qty {
+        if qty > max_qty {
+            qty = executor::quantize_down(max_qty, constraints.step_size);
+        }
+    }
+
+    if constraints.min_notional > 0.0 && price > 0.0 {
+        let required =
+            executor::quantize_up(constraints.min_notional / price, constraints.step_size);
+        if required > qty {
+            qty = required;
+        }
+    }
+
+    if qty > effective_max {
+        qty = executor::quantize_down(effective_max, constraints.step_size);
+    }
+
+    if let Some(max_qty) = constraints.max_qty {
+        if qty > max_qty {
+            qty = executor::quantize_down(max_qty, constraints.step_size);
+        }
+    }
+
+    if qty < constraints.min_qty {
+        return None;
+    }
+
+    if constraints.min_notional > 0.0 && price > 0.0 {
+        if qty * price + f64::EPSILON < constraints.min_notional {
+            return None;
+        }
+    }
+
+    if qty <= 0.0 {
+        None
+    } else {
+        Some(qty)
+    }
 }
 
 // 配置结构
@@ -22,13 +109,11 @@ struct Config {
     binance_api_key: String,
     binance_secret: String,
     deepseek_api_key: String,
-    trade_symbols: Vec<String>,  // 多标的交易
-    min_trade_amount: f64,  // 最小交易数量
-    max_trade_amount: f64,  // 最大交易数量
+    trade_symbols: Vec<String>, // 多标的交易
     trade_interval_secs: u64,
     leverage: u32,
-    max_position: f64,  // 每个标的最大持仓量
-    portfolio_mode: String,  // balanced/aggressive/conservative
+    max_position: f64,      // 每个标的最大持仓量
+    portfolio_mode: String, // balanced/aggressive/conservative
 }
 
 impl Config {
@@ -45,14 +130,6 @@ impl Config {
             binance_secret: env::var("BINANCE_SECRET").context("缺少 BINANCE_SECRET")?,
             deepseek_api_key: env::var("DEEPSEEK_API_KEY").context("缺少 DEEPSEEK_API_KEY")?,
             trade_symbols,
-            min_trade_amount: env::var("MIN_TRADE_AMOUNT")
-                .unwrap_or_else(|_| "0.001".to_string())
-                .parse()
-                .context("MIN_TRADE_AMOUNT 格式错误")?,
-            max_trade_amount: env::var("MAX_TRADE_AMOUNT")
-                .unwrap_or_else(|_| "0.003".to_string())
-                .parse()
-                .context("MAX_TRADE_AMOUNT 格式错误")?,
             trade_interval_secs: match env::var("TRADE_INTERVAL")
                 .unwrap_or_else(|_| "1m".to_string())
                 .as_str()
@@ -71,154 +148,213 @@ impl Config {
                 .unwrap_or_else(|_| "0.005".to_string())
                 .parse()
                 .context("MAX_POSITION 格式错误")?,
-            portfolio_mode: env::var("PORTFOLIO_MODE")
-                .unwrap_or_else(|_| "balanced".to_string()),
+            portfolio_mode: env::var("PORTFOLIO_MODE").unwrap_or_else(|_| "balanced".to_string()),
         })
     }
 }
 
-// Task 7.1: 单个标的交易周期
-async fn run_single_symbol_cycle(
-    symbol: &str,
+// 并行阶段：每个标的的行情与持仓分析
+async fn analyze_symbol(
+    symbol: String,
     config: &Config,
     interval_str: &str,
-    allocated_max_amount: f64,  // 投资组合分配的最大数量
     use_cache: bool,
-    cached_account: &Option<executor::AccountInfo>,
-    cached_position: &Option<types::Position>,
-) -> Result<CycleResult> {
-    println!("\n--- 处理标的: {} ---", symbol);
+    cached_position: Option<types::Position>,
+) -> Result<SymbolAnalysis> {
+    info!("--- 分析标的: {} ---", symbol);
 
     // 1. 获取K线数据
-    let klines = market::fetch_klines(symbol, interval_str, 20).await?;
-    println!("✓ 获取到 {} 根K线", klines.len());
+    const ANALYSIS_KLINE_LIMIT: u32 = 120;
+    let klines = market::fetch_klines(&symbol, interval_str, ANALYSIS_KLINE_LIMIT).await?;
+    info!("获取到 {} 根K线", klines.len());
 
     // 2. 计算技术指标
     let indicators = market::calculate_indicators(&klines)?;
-    println!(
-        "✓ 技术指标: SMA(5)={:.2}, SMA(20)={:.2}, 价格变化1={:.2}%",
-        indicators.sma_5, indicators.sma_20, indicators.price_change_1
+    info!(
+        "技术指标: SMA5={:.2}, SMA20={:.2}, SMA50={:.2}, SMA100={:.2}, Δ1={:.2}%, Δ3={:.2}%, Δ6={:.2}%, Δ12={:.2}%, ATR14={:.4} ({:.2}%), 量比={:.2}",
+        indicators.sma_5,
+        indicators.sma_20,
+        indicators.sma_50,
+        indicators.sma_100,
+        indicators.price_change_1,
+        indicators.price_change_3,
+        indicators.price_change_6,
+        indicators.price_change_12,
+        indicators.atr_14,
+        indicators.atr_percent,
+        indicators.volume_ratio
     );
 
-    // 3. 使用缓存的账户信息或重新查询
-    let account = if use_cache && cached_account.is_some() {
-        println!("✓ 账户: 可用余额 {} USDT (缓存)", cached_account.as_ref().unwrap().availableBalance);
-        cached_account.as_ref().unwrap().clone()
-    } else {
-        let acc = executor::get_account_info(&config.binance_api_key, &config.binance_secret).await?;
-        println!("✓ 账户: 可用余额 {} USDT", acc.availableBalance);
-        acc
-    };
-
-    // 4. 使用缓存的持仓信息或重新查询
+    // 3. 获取持仓（优先使用缓存）
     let position = if use_cache {
         match cached_position {
             None => {
-                println!("✓ 当前持仓: 空仓 (缓存)");
+                info!("当前持仓: 空仓 (缓存)");
                 None
             }
             Some(pos) => {
-                println!(
-                    "✓ 当前持仓: {:?}仓 {:.4}, 盈亏: {:.2} USDT (缓存)",
+                info!(
+                    "当前持仓: {:?}仓 {:.4}, 盈亏: {:.2} USDT (缓存)",
                     pos.side, pos.amount, pos.unrealized_pnl
                 );
-                Some(pos.clone())
+                Some(pos)
             }
         }
     } else {
-        let pos = executor::get_position(
-            symbol,
-            &config.binance_api_key,
-            &config.binance_secret,
-        )
-        .await?;
+        let pos = executor::get_position(&symbol, &config.binance_api_key, &config.binance_secret)
+            .await?;
         match &pos {
-            None => println!("✓ 当前持仓: 空仓"),
-            Some(p) => println!(
-                "✓ 当前持仓: {:?}仓 {:.4}, 盈亏: {:.2} USDT",
+            None => info!("当前持仓: 空仓"),
+            Some(p) => info!(
+                "当前持仓: {:?}仓 {:.4}, 盈亏: {:.2} USDT",
                 p.side, p.amount, p.unrealized_pnl
             ),
         }
         pos
     };
 
-    // 5. 多智能体决策流程
-    println!("\n--- 多智能体决策开始 ---");
-
-    // 5.1 行情分析员
+    // 4. 行情分析
+    info!("--- 行情分析员决策 ---");
     let market_report = multi_agent::market_analyst_analyze(
+        &symbol,
+        interval_str,
         &klines,
         &indicators,
         &config.deepseek_api_key,
     )
     .await?;
-    println!(
-        "✓ 行情分析员: {:?} ({:?}) | 阶段: {:?} | {}",
-        market_report.trend, market_report.strength, market_report.market_phase, market_report.analysis
+    info!(
+        "行情分析员: {:?} ({:?}) | 阶段: {:?} | {}",
+        market_report.trend,
+        market_report.strength,
+        market_report.market_phase,
+        market_report.analysis
     );
 
-    // 5.2 策略研究员
+    Ok(SymbolAnalysis {
+        symbol,
+        position,
+        market_report,
+    })
+}
+
+// 决策与执行阶段：在所有分析完成后顺序执行
+async fn execute_symbol_cycle(
+    analysis: &SymbolAnalysis,
+    allocated_max_amount: f64,
+    allocated_balance: f64,
+    constraints: &executor::SymbolConstraints,
+    config: &Config,
+) -> Result<SymbolCycleResult> {
+    info!("--- 决策执行: {} ---", analysis.symbol);
+
+    // 获取实时账户信息
+    let account =
+        executor::get_account_info(&config.binance_api_key, &config.binance_secret).await?;
+    info!("账户: 可用余额 {} USDT", account.availableBalance);
+
+    match &analysis.position {
+        None => info!("当前持仓: 空仓"),
+        Some(pos) => info!(
+            "当前持仓: {:?}仓 {:.4}, 盈亏: {:.2} USDT",
+            pos.side, pos.amount, pos.unrealized_pnl
+        ),
+    }
+
+    info!("--- 多智能体决策开始 ---");
+
+    // 策略研究员
     let strategy = multi_agent::strategy_researcher_suggest(
-        &market_report,
-        &position,
+        &analysis.symbol,
+        &analysis.market_report,
+        &analysis.position,
         &config.deepseek_api_key,
     )
     .await?;
-    println!(
-        "✓ 策略研究员: {:?} | 时机评分: {}/10 | {}",
+    info!(
+        "策略研究员: {:?} | 时机评分: {}/10 | {}",
         strategy.action, strategy.timing_score, strategy.reasoning
     );
 
-    // 5.3 风险管理员
+    // 风险管理员
     let risk = multi_agent::risk_manager_assess(
-        &market_report,
+        &analysis.symbol,
+        &analysis.market_report,
         &strategy,
         &account,
-        &position,
-        config.min_trade_amount,
-        allocated_max_amount,  // 使用投资组合分配的最大数量
+        &analysis.position,
+        constraints,
+        allocated_balance,
+        allocated_max_amount,
         config.max_position,
         &config.deepseek_api_key,
     )
     .await?;
-    println!(
-        "✓ 风险管理员: {:?} | 审批: {:?} | 建议数量: {:.4} | {}",
+    info!(
+        "风险管理员: {:?} | 审批: {:?} | 建议数量: {:.4} | {}",
         risk.risk_level, risk.approval, risk.suggested_amount, risk.reason
     );
     if !risk.warnings.is_empty() {
-        println!("  ⚠️  风险警告: {}", risk.warnings.join(", "));
+        warn!("风险警告: {}", risk.warnings.join(", "));
     }
 
-    // 5.4 决策交易员
+    // 决策交易员
     let decision = multi_agent::trade_executor_decide(
-        &market_report,
+        &analysis.symbol,
+        &analysis.market_report,
         &strategy,
         &risk,
         &config.deepseek_api_key,
     )
     .await?;
-    println!(
-        "✓ 决策交易员: {:?}, 数量: {:.4}, 信心: {:?} | {}",
+    info!(
+        "决策交易员: {:?}, 数量: {:.4}, 信心: {:?} | {}",
         decision.signal, decision.amount, decision.confidence, decision.reason
     );
-    println!("--- 多智能体决策完成 ---\n");
+    info!("--- 多智能体决策完成 ---");
 
-    state::log_decision(symbol, &decision, &position)?;
+    state::log_decision(&analysis.symbol, &decision, &analysis.position)?;
 
-    // 6. 执行交易
     let mut traded = false;
+    let mut account_snapshot = Some(account.clone());
+    let mut position_snapshot = analysis.position.clone();
+
     if decision.signal != types::Signal::Hold {
-        let price = market::fetch_current_price(symbol).await?;
-        // 限制AI建议的数量在配置范围内
-        let trade_amount = decision.amount.clamp(config.min_trade_amount, allocated_max_amount);
-        if trade_amount != decision.amount {
-            println!("  ⚠️  AI建议数量 {:.4} 超出范围，调整为 {:.4}", decision.amount, trade_amount);
+        let price = market::fetch_current_price(&analysis.symbol).await?;
+        let maybe_trade_amount = adjust_trade_quantity(
+            decision.amount,
+            allocated_max_amount,
+            allocated_balance,
+            price,
+            constraints,
+        );
+
+        let trade_amount = match maybe_trade_amount {
+            Some(qty) => qty,
+            None => {
+                warn!(
+                    "无法满足交易约束，保持观望: 建议 {:.6}, 分配上限 {:.6}, 分配资金 {:.2} USDT, 价格 {:.6}",
+                    decision.amount, allocated_max_amount, allocated_balance, price
+                );
+                return Ok(SymbolCycleResult {
+                    traded: false,
+                    account_snapshot: Some(account),
+                    position_snapshot: analysis.position.clone(),
+                });
+            }
+        };
+
+        if (trade_amount - decision.amount).abs() > f64::EPSILON {
+            warn!(
+                "交易数量根据约束调整: 建议 {:.6} → {:.6}",
+                decision.amount, trade_amount
+            );
         }
 
         match executor::execute_decision(
-            symbol,
+            &analysis.symbol,
             &decision,
-            &position,
+            &analysis.position,
             price,
             trade_amount,
             config.max_position,
@@ -228,26 +364,39 @@ async fn run_single_symbol_cycle(
         .await
         {
             Ok(result) => {
-                // 判断是否真正执行了交易（不是Hold）
                 traded = !matches!(result.action, types::TradeAction::Hold);
 
-                println!(
-                    "✓ 交易执行: {:?}, 价格: {:.2}, 数量: {:.4}",
+                info!(
+                    "交易执行: {:?}, 价格: {:.2}, 数量: {:.4}",
                     result.action, result.price, result.amount
                 );
                 if let Some(details) = &result.order_details {
-                    println!("  订单详情: {}", details);
+                    info!("订单详情: {}", details);
                 }
                 if let Some(pnl) = result.pnl {
-                    println!("  平仓盈亏: {:.2} USDT", pnl);
+                    info!("平仓盈亏: {:.2} USDT", pnl);
                 }
                 state::log_trade(&result)?;
+
+                if traded {
+                    account_snapshot =
+                        executor::get_account_info(&config.binance_api_key, &config.binance_secret)
+                            .await
+                            .ok();
+                    position_snapshot = executor::get_position(
+                        &analysis.symbol,
+                        &config.binance_api_key,
+                        &config.binance_secret,
+                    )
+                    .await
+                    .ok()
+                    .flatten();
+                }
             }
             Err(e) => {
-                eprintln!("✗ 交易执行失败: {:#}", e);
-                // 记录失败的交易尝试
+                error!("交易执行失败: {:#}", e);
                 let failed_result = types::TradeResult {
-                    symbol: symbol.to_string(),
+                    symbol: analysis.symbol.clone(),
                     action: types::TradeAction::Hold,
                     price,
                     amount: 0.0,
@@ -260,54 +409,65 @@ async fn run_single_symbol_cycle(
             }
         }
     } else {
-        println!("✓ 保持观望");
+        info!("保持观望");
     }
 
-    Ok(CycleResult { traded })
+    Ok(SymbolCycleResult {
+        traded,
+        account_snapshot,
+        position_snapshot,
+    })
 }
 
 // 多标的投资组合交易周期
 async fn run_portfolio_cycle(
     config: &Config,
     interval_str: &str,
-    symbols_cache: &mut std::collections::HashMap<String, (Option<executor::AccountInfo>, Option<types::Position>, bool)>,
+    constraints_map: &std::collections::HashMap<String, executor::SymbolConstraints>,
+    symbols_cache: &mut std::collections::HashMap<
+        String,
+        (Option<executor::AccountInfo>, Option<types::Position>, bool),
+    >,
 ) -> Result<bool> {
-    println!("\n============================================================");
-    println!("执行时间: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
-    println!("============================================================");
+    info!("============================================================");
+    info!(
+        "执行时间: {}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    );
+    info!("============================================================");
 
     // 1. 获取所有标的的行情分析
-    println!("\n=== 第一阶段：行情分析 ===");
-    let mut symbols_reports: Vec<(String, types::MarketReport)> = Vec::new();
-
+    info!("=== 第一阶段：行情分析 (并行) ===");
+    let mut analysis_futures = Vec::new();
     for symbol in &config.trade_symbols {
-        println!("\n分析标的: {}", symbol);
-        let klines = market::fetch_klines(symbol, interval_str, 20).await?;
-        let indicators = market::calculate_indicators(&klines)?;
+        let symbol_clone = symbol.clone();
+        let (_, cached_position, use_cache) = symbols_cache
+            .get(symbol)
+            .cloned()
+            .unwrap_or((None, None, false));
 
-        let market_report = multi_agent::market_analyst_analyze(
-            &klines,
-            &indicators,
-            &config.deepseek_api_key,
-        )
-        .await?;
-
-        println!(
-            "  趋势: {:?} ({:?}) | 阶段: {:?}",
-            market_report.trend, market_report.strength, market_report.market_phase
-        );
-
-        symbols_reports.push((symbol.clone(), market_report));
+        analysis_futures.push(analyze_symbol(
+            symbol_clone,
+            config,
+            interval_str,
+            use_cache,
+            cached_position,
+        ));
     }
 
+    let analyses: Vec<SymbolAnalysis> = try_join_all(analysis_futures).await?;
+
     // 2. 投资组合协调员分配资金
-    println!("\n=== 第二阶段：投资组合资金分配 ===");
+    info!("=== 第二阶段：投资组合资金分配 ===");
+    let symbols_reports: Vec<(String, types::MarketReport)> = analyses
+        .iter()
+        .map(|a| (a.symbol.clone(), a.market_report.clone()))
+        .collect();
 
-    // 获取总可用余额（使用第一个标的的账户信息，因为是共享账户）
-    let account = executor::get_account_info(&config.binance_api_key, &config.binance_secret).await?;
+    let account =
+        executor::get_account_info(&config.binance_api_key, &config.binance_secret).await?;
     let total_balance: f64 = account.availableBalance.parse().unwrap_or(0.0);
-
-    println!("总可用资金: {} USDT", total_balance);
+    info!("总可用资金: {} USDT", total_balance);
 
     let portfolio_allocation = multi_agent::portfolio_coordinator_allocate(
         &symbols_reports,
@@ -317,12 +477,12 @@ async fn run_portfolio_cycle(
     )
     .await?;
 
-    println!("组合策略: {:?}", portfolio_allocation.strategy);
-    println!("分配理由: {}", portfolio_allocation.reasoning);
-    println!("\n各标的分配:");
+    info!("组合策略: {:?}", portfolio_allocation.strategy);
+    info!("分配理由: {}", portfolio_allocation.reasoning);
+    info!("各标的分配:");
     for alloc in &portfolio_allocation.allocations {
-        println!(
-            "  {} - 权重:{:.1}% | 优先级:{:?} | 分配:{:.2} USDT",
+        info!(
+            "{} - 权重:{:.1}% | 优先级:{:?} | 分配:{:.2} USDT",
             alloc.symbol,
             alloc.weight * 100.0,
             alloc.priority,
@@ -331,57 +491,91 @@ async fn run_portfolio_cycle(
     }
 
     // 3. 对每个标的执行交易决策
-    println!("\n=== 第三阶段：执行交易 ===");
+    info!("=== 第三阶段：执行交易 ===");
+    let mut analysis_map: std::collections::HashMap<String, SymbolAnalysis> = analyses
+        .into_iter()
+        .map(|analysis| (analysis.symbol.clone(), analysis))
+        .collect();
 
     let mut any_traded = false;
+    let mut execution_futures = Vec::new();
 
     for alloc in &portfolio_allocation.allocations {
-        // 跳过优先级为Skip的标的
+        let analysis = match analysis_map.remove(&alloc.symbol) {
+            Some(a) => a,
+            None => {
+                error!("未找到标的 {} 的分析结果，跳过执行", alloc.symbol);
+                symbols_cache.insert(alloc.symbol.clone(), (None, None, false));
+                continue;
+            }
+        };
+
         if alloc.priority == types::AllocationPriority::Skip {
-            println!("\n跳过标的: {} (优先级: Skip)", alloc.symbol);
+            info!("跳过标的: {} (优先级: Skip)", alloc.symbol);
+            symbols_cache.insert(
+                alloc.symbol.clone(),
+                (None, analysis.position.clone(), analysis.position.is_some()),
+            );
             continue;
         }
 
-        // 确定该标的的最大交易量
-        let max_amount = alloc.max_amount_override.unwrap_or(config.max_trade_amount);
+        let max_amount = alloc.max_amount_override.unwrap_or(config.max_position);
+        let allocated_balance = alloc.allocated_balance;
+        let symbol = alloc.symbol.clone();
+        let constraint = match constraints_map.get(&symbol) {
+            Some(c) => *c,
+            None => {
+                error!("缺少交易约束，跳过标的 {}", symbol);
+                symbols_cache.insert(symbol.clone(), (None, None, false));
+                continue;
+            }
+        };
 
-        // 从缓存获取状态
-        let (cached_account, cached_position, use_cache) = symbols_cache
-            .get(&alloc.symbol)
-            .cloned()
-            .unwrap_or((None, None, false));
+        execution_futures.push(async move {
+            let exec = execute_symbol_cycle(
+                &analysis,
+                max_amount,
+                allocated_balance,
+                &constraint,
+                config,
+            )
+            .await;
+            (symbol, exec, analysis)
+        });
+    }
 
-        // 执行单个标的的交易周期
-        match run_single_symbol_cycle(
-            &alloc.symbol,
-            config,
-            interval_str,
-            max_amount,
-            use_cache,
-            &cached_account,
-            &cached_position,
-        )
-        .await
-        {
+    let execution_results = join_all(execution_futures).await;
+
+    for (symbol, outcome, analysis) in execution_results {
+        match outcome {
             Ok(result) => {
                 if result.traded {
                     any_traded = true;
-
-                    // 更新该标的的缓存
-                    let new_account = executor::get_account_info(&config.binance_api_key, &config.binance_secret).await.ok();
-                    let new_position = executor::get_position(&alloc.symbol, &config.binance_api_key, &config.binance_secret).await.ok().flatten();
-
-                    symbols_cache.insert(alloc.symbol.clone(), (new_account, new_position, true));
-                } else {
-                    // 未交易，继续使用缓存
                 }
+
+                let cache_account = result.account_snapshot.clone();
+                let cache_position = if let Some(pos) = result.position_snapshot.clone() {
+                    Some(pos)
+                } else {
+                    analysis.position.clone()
+                };
+                let use_cache = cache_account.is_some() || cache_position.is_some();
+
+                symbols_cache.insert(symbol, (cache_account, cache_position, use_cache));
             }
             Err(e) => {
-                eprintln!("\n✗ 标的 {} 交易周期失败: {:#}\n", alloc.symbol, e);
-                // 失败时清除该标的的缓存
-                symbols_cache.insert(alloc.symbol.clone(), (None, None, false));
+                error!("标的 {} 交易周期失败: {:#}", symbol, e);
+                symbols_cache.insert(symbol, (None, None, false));
             }
         }
+    }
+
+    // 对未参与决策的分析结果更新缓存
+    for (symbol, analysis) in analysis_map.into_iter() {
+        symbols_cache.insert(
+            symbol,
+            (None, analysis.position.clone(), analysis.position.is_some()),
+        );
     }
 
     Ok(any_traded)
@@ -393,31 +587,47 @@ async fn main() -> Result<()> {
     // 加载环境变量
     dotenv().ok();
 
+    logging::init_logging().context("初始化日志系统失败")?;
+
     // 加载配置
     let config = Config::from_env().context("配置加载失败")?;
 
+    let symbol_constraints = executor::fetch_symbol_constraints(&config.trade_symbols)
+        .await
+        .context("拉取交易规则失败")?;
+
     // 启动日志
-    println!("\n============================================================");
-    println!("多智能体加密货币自动交易系统 - 投资组合版");
-    println!("============================================================\n");
-    println!("交易标的: {:?}", config.trade_symbols);
-    println!("组合策略: {}", config.portfolio_mode);
-    println!("交易数量: {:.4} - {:.4} (AI决策)", config.min_trade_amount, config.max_trade_amount);
-    println!("杠杆倍数: {}x", config.leverage);
-    println!(
+    info!("============================================================");
+    info!("多智能体加密货币自动交易系统 - 投资组合版");
+    info!("============================================================");
+    info!("交易标的: {:?}", config.trade_symbols);
+    info!("组合策略: {}", config.portfolio_mode);
+    info!("杠杆倍数: {}x", config.leverage);
+    for symbol in &config.trade_symbols {
+        if let Some(cons) = symbol_constraints.get(symbol) {
+            info!(
+                "约束 {}: step={}, minQty={}, minNotional={}, maxQty={:?}",
+                symbol, cons.step_size, cons.min_qty, cons.min_notional, cons.max_qty
+            );
+        }
+    }
+    info!(
         "交易周期: {}秒 ({}分钟)",
         config.trade_interval_secs,
         config.trade_interval_secs / 60
     );
-    println!("API密钥: {}***", &config.binance_api_key[..8]);
-    println!("\n启动中...\n");
+    info!("API密钥前缀: {}***", &config.binance_api_key[..8]);
+    info!("启动中...");
 
     // 环境检查 - 测试Binance连接（使用第一个标的）
     if let Some(first_symbol) = config.trade_symbols.first() {
         match market::fetch_current_price(first_symbol).await {
-            Ok(price) => println!("✓ Binance API 连接成功, {} 当前价格: ${:.2}", first_symbol, price),
+            Ok(price) => info!(
+                "Binance API 连接成功, {} 当前价格: ${:.2}",
+                first_symbol, price
+            ),
             Err(e) => {
-                eprintln!("✗ Binance API 连接失败: {:#}", e);
+                error!("Binance API 连接失败: {:#}", e);
                 return Err(e);
             }
         }
@@ -425,9 +635,9 @@ async fn main() -> Result<()> {
 
     // 设置持仓模式为双向 (必须在交易前设置)
     match executor::set_dual_position_mode(&config.binance_api_key, &config.binance_secret).await {
-        Ok(_) => println!("✓ 持仓模式设置成功: 双向持仓"),
+        Ok(_) => info!("持仓模式设置成功: 双向持仓"),
         Err(e) => {
-            eprintln!("✗ 持仓模式设置失败: {:#}", e);
+            error!("持仓模式设置失败: {:#}", e);
             return Err(e);
         }
     }
@@ -442,45 +652,42 @@ async fn main() -> Result<()> {
         )
         .await
         {
-            Ok(_) => println!("✓ {} 杠杆设置成功: {}x", symbol, config.leverage),
+            Ok(_) => info!("{} 杠杆设置成功: {}x", symbol, config.leverage),
             Err(e) => {
-                eprintln!("✗ {} 杠杆设置失败: {:#}", symbol, e);
+                error!("{} 杠杆设置失败: {:#}", symbol, e);
                 // 继续处理其他标的，不中断
             }
         }
     }
 
     // 获取并显示账户信息
-    println!("\n账户状态:");
+    info!("账户状态:");
     match executor::get_account_info(&config.binance_api_key, &config.binance_secret).await {
         Ok(account) => {
-            println!("  总余额: {} USDT", account.totalWalletBalance);
-            println!("  可用余额: {} USDT", account.availableBalance);
+            info!("总余额: {} USDT", account.totalWalletBalance);
+            info!("可用余额: {} USDT", account.availableBalance);
         }
         Err(e) => {
-            eprintln!("  获取账户信息失败: {:#}", e);
+            error!("获取账户信息失败: {:#}", e);
         }
     }
 
     // 获取并显示所有标的的持仓
-    println!("\n各标的持仓:");
+    info!("各标的持仓:");
     for symbol in &config.trade_symbols {
-        match executor::get_position(
-            symbol,
-            &config.binance_api_key,
-            &config.binance_secret,
-        )
-        .await
+        match executor::get_position(symbol, &config.binance_api_key, &config.binance_secret).await
         {
             Ok(Some(pos)) => {
-                println!("  {} - {:?}仓 {:.4}, 入场 ${:.2}, 盈亏 {:.2} USDT",
-                    symbol, pos.side, pos.amount, pos.entry_price, pos.unrealized_pnl);
+                info!(
+                    "{} - {:?}仓 {:.4}, 入场 ${:.2}, 盈亏 {:.2} USDT",
+                    symbol, pos.side, pos.amount, pos.entry_price, pos.unrealized_pnl
+                );
             }
             Ok(None) => {
-                println!("  {} - 空仓", symbol);
+                info!("{} - 空仓", symbol);
             }
             Err(e) => {
-                eprintln!("  {} - 获取失败: {:#}", symbol, e);
+                error!("{} - 获取失败: {:#}", symbol, e);
             }
         }
     }
@@ -507,6 +714,7 @@ async fn main() -> Result<()> {
         match run_portfolio_cycle(
             &config,
             interval_str,
+            &symbol_constraints,
             &mut symbols_cache,
         )
         .await
@@ -515,7 +723,7 @@ async fn main() -> Result<()> {
                 // run_portfolio_cycle内部已处理缓存更新
             }
             Err(e) => {
-                eprintln!("\n✗ 投资组合交易周期失败: {:#}\n", e);
+                error!("投资组合交易周期失败: {:#}", e);
                 // 错误时清空所有缓存
                 symbols_cache.clear();
             }

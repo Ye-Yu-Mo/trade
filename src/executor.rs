@@ -8,6 +8,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<Sha256>;
 
+#[derive(Debug, Clone, Copy)]
+pub struct SymbolConstraints {
+    pub step_size: f64,
+    pub min_qty: f64,
+    pub max_qty: Option<f64>,
+    pub min_notional: f64,
+    pub tick_size: f64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[allow(non_snake_case)]
 pub struct AccountInfo {
@@ -53,6 +62,126 @@ fn get_timestamp() -> u64 {
         .as_millis() as u64
 }
 
+#[derive(Debug, Deserialize)]
+struct ExchangeInfoResponse {
+    symbols: Vec<ExchangeInfoSymbol>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExchangeInfoSymbol {
+    symbol: String,
+    filters: Vec<ExchangeFilter>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "filterType")]
+enum ExchangeFilter {
+    #[serde(rename = "LOT_SIZE")]
+    LotSize {
+        #[serde(rename = "minQty")]
+        min_qty: String,
+        #[serde(rename = "maxQty")]
+        max_qty: String,
+        #[serde(rename = "stepSize")]
+        step_size: String,
+    },
+    #[serde(rename = "PRICE_FILTER")]
+    PriceFilter {
+        #[serde(rename = "tickSize")]
+        tick_size: String,
+    },
+    #[serde(rename = "MIN_NOTIONAL")]
+    MinNotional {
+        #[serde(rename = "notional")]
+        notional: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
+fn parse_float(value: &str) -> f64 {
+    value.parse::<f64>().unwrap_or(0.0)
+}
+
+pub async fn fetch_symbol_constraints(
+    symbols: &[String],
+) -> Result<std::collections::HashMap<String, SymbolConstraints>> {
+    let base_url = get_binance_base_url();
+    let mut map = std::collections::HashMap::new();
+
+    for symbol in symbols {
+        let url = format!("{}/fapi/v1/exchangeInfo?symbol={}", base_url, symbol);
+        let resp: ExchangeInfoResponse = reqwest::get(&url)
+            .await
+            .with_context(|| format!("获取交易规则失败: {}", symbol))?
+            .json()
+            .await
+            .with_context(|| format!("解析交易规则失败: {}", symbol))?;
+
+        let info = resp
+            .symbols
+            .into_iter()
+            .find(|s| s.symbol == *symbol)
+            .with_context(|| format!("交易规则中缺少标的: {}", symbol))?;
+
+        let mut step_size = None;
+        let mut min_qty = None;
+        let mut max_qty = None;
+        let mut min_notional = None;
+        let mut tick_size = None;
+
+        for filter in info.filters {
+            match filter {
+                ExchangeFilter::LotSize {
+                    min_qty: min,
+                    max_qty: max,
+                    step_size: step,
+                } => {
+                    min_qty = Some(parse_float(&min));
+                    let mq = parse_float(&max);
+                    max_qty = if mq > 0.0 { Some(mq) } else { None };
+                    step_size = Some(parse_float(&step));
+                }
+                ExchangeFilter::PriceFilter { tick_size: tick } => {
+                    tick_size = Some(parse_float(&tick));
+                }
+                ExchangeFilter::MinNotional { notional } => {
+                    min_notional = Some(parse_float(&notional));
+                }
+                ExchangeFilter::Other => {}
+            }
+        }
+
+        let constraints = SymbolConstraints {
+            step_size: step_size.unwrap_or(0.0),
+            min_qty: min_qty.unwrap_or(0.0),
+            max_qty,
+            min_notional: min_notional.unwrap_or(0.0),
+            tick_size: tick_size.unwrap_or(0.0),
+        };
+
+        map.insert(symbol.clone(), constraints);
+    }
+
+    Ok(map)
+}
+
+pub fn quantize_down(value: f64, step: f64) -> f64 {
+    if step <= 0.0 {
+        return value;
+    }
+    let steps = (value / step).floor();
+    (steps * step).max(0.0)
+}
+
+pub fn quantize_up(value: f64, step: f64) -> f64 {
+    if step <= 0.0 {
+        return value;
+    }
+    let steps = (value / step).ceil();
+    (steps * step).max(0.0)
+}
+
 // Task 5.1: 查询当前持仓
 #[derive(Debug, Deserialize)]
 #[allow(non_snake_case)]
@@ -63,11 +192,7 @@ struct PositionRisk {
     unRealizedProfit: String,
 }
 
-pub async fn get_position(
-    symbol: &str,
-    api_key: &str,
-    secret: &str,
-) -> Result<Option<Position>> {
+pub async fn get_position(symbol: &str, api_key: &str, secret: &str) -> Result<Option<Position>> {
     let base_url = get_binance_base_url();
     let timestamp = get_timestamp();
     let query_string = format!("timestamp={}", timestamp);
@@ -139,10 +264,7 @@ pub async fn get_account_info(api_key: &str, secret: &str) -> Result<AccountInfo
 }
 
 // 设置持仓模式为双向 (Hedge Mode)
-pub async fn set_dual_position_mode(
-    api_key: &str,
-    secret: &str,
-) -> Result<()> {
+pub async fn set_dual_position_mode(api_key: &str, secret: &str) -> Result<()> {
     let base_url = get_binance_base_url();
     let timestamp = get_timestamp();
     let query_string = format!("dualSidePosition=true&timestamp={}", timestamp);
@@ -163,24 +285,26 @@ pub async fn set_dual_position_mode(
 
     let status = response.status();
     if !status.is_success() {
-        let error_text = response.text().await.unwrap_or_else(|_| "未知错误".to_string());
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "未知错误".to_string());
         // 如果已经是双向模式,会返回错误但可以忽略
         if error_text.contains("-4059") {
             return Ok(()); // 已经是双向模式
         }
-        return Err(anyhow::anyhow!("设置持仓模式失败 [{}]: {}", status, error_text));
+        return Err(anyhow::anyhow!(
+            "设置持仓模式失败 [{}]: {}",
+            status,
+            error_text
+        ));
     }
 
     Ok(())
 }
 
 // 设置杠杆倍数
-pub async fn set_leverage(
-    symbol: &str,
-    leverage: u32,
-    api_key: &str,
-    secret: &str,
-) -> Result<()> {
+pub async fn set_leverage(symbol: &str, leverage: u32, api_key: &str, secret: &str) -> Result<()> {
     let base_url = get_binance_base_url();
     let timestamp = get_timestamp();
     let query_string = format!(
@@ -204,7 +328,10 @@ pub async fn set_leverage(
 
     let status = response.status();
     if !status.is_success() {
-        let error_text = response.text().await.unwrap_or_else(|_| "未知错误".to_string());
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "未知错误".to_string());
         return Err(anyhow::anyhow!("设置杠杆失败 [{}]: {}", status, error_text));
     }
 
@@ -214,7 +341,7 @@ pub async fn set_leverage(
 // Task 5.2: 订单执行函数
 async fn place_order(
     symbol: &str,
-    side: &str,        // BUY or SELL
+    side: &str,          // BUY or SELL
     position_side: &str, // LONG or SHORT
     quantity: f64,
     api_key: &str,
@@ -269,39 +396,19 @@ async fn place_order(
     }
 }
 
-async fn open_long(
-    symbol: &str,
-    amount: f64,
-    api_key: &str,
-    secret: &str,
-) -> Result<String> {
+async fn open_long(symbol: &str, amount: f64, api_key: &str, secret: &str) -> Result<String> {
     place_order(symbol, "BUY", "LONG", amount, api_key, secret).await
 }
 
-async fn close_long(
-    symbol: &str,
-    amount: f64,
-    api_key: &str,
-    secret: &str,
-) -> Result<String> {
+async fn close_long(symbol: &str, amount: f64, api_key: &str, secret: &str) -> Result<String> {
     place_order(symbol, "SELL", "LONG", amount, api_key, secret).await
 }
 
-async fn open_short(
-    symbol: &str,
-    amount: f64,
-    api_key: &str,
-    secret: &str,
-) -> Result<String> {
+async fn open_short(symbol: &str, amount: f64, api_key: &str, secret: &str) -> Result<String> {
     place_order(symbol, "SELL", "SHORT", amount, api_key, secret).await
 }
 
-async fn close_short(
-    symbol: &str,
-    amount: f64,
-    api_key: &str,
-    secret: &str,
-) -> Result<String> {
+async fn close_short(symbol: &str, amount: f64, api_key: &str, secret: &str) -> Result<String> {
     place_order(symbol, "BUY", "SHORT", amount, api_key, secret).await
 }
 

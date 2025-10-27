@@ -3,7 +3,10 @@ use crate::types::{Kline, Position, TechnicalIndicators, TradingDecision};
 use anyhow::{Context, Result};
 use async_openai::{
     config::OpenAIConfig,
-    types::{ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs},
+    types::{
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
+    },
     Client,
 };
 
@@ -164,7 +167,9 @@ pub async fn analyze(
     max_amount: f64,
     api_key: &str,
 ) -> Result<TradingDecision> {
-    let prompt = build_prompt(klines, indicators, position, account, min_amount, max_amount);
+    let prompt = build_prompt(
+        klines, indicators, position, account, min_amount, max_amount,
+    );
 
     let config = OpenAIConfig::new()
         .with_api_key(api_key)
@@ -178,12 +183,12 @@ pub async fn analyze(
             ChatCompletionRequestMessage::System(
                 ChatCompletionRequestSystemMessageArgs::default()
                     .content(get_system_prompt())
-                    .build()?
+                    .build()?,
             ),
             ChatCompletionRequestMessage::User(
                 ChatCompletionRequestUserMessageArgs::default()
                     .content(prompt)
-                    .build()?
+                    .build()?,
             ),
         ])
         .build()?;

@@ -1,0 +1,8 @@
+/target
+
+# 环境变量（包含敏感API密钥）
+.env
+
+# 交易日志
+logs/
+*.log

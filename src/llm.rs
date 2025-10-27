@@ -40,6 +40,8 @@ fn build_prompt(
     indicators: &TechnicalIndicators,
     position: &Option<Position>,
     account: &AccountInfo,
+    min_amount: f64,
+    max_amount: f64,
 ) -> String {
     // 最近5根K线（从旧到新）
     let recent_klines: Vec<&Kline> = klines.iter().rev().take(5).rev().collect();
@@ -112,19 +114,29 @@ fn build_prompt(
 **成交量**: {}
 **持仓**: {}
 **账户**: 可用余额 {} USDT
+**交易限制**: 单次最小 {:.4}, 最大 {:.4}
 
 ## 任务
 基于以上数据，以激进交易员的视角给出决策：
 - 有动量信号（价格变化>±0.3%或均线发散）→ 立即BUY/SELL
 - 多头排列且非大幅回调 → 偏向BUY
 - 空头排列且非大幅反弹 → 偏向SELL
+- **支持加仓**: 已持有多仓时可继续BUY加多，已持有空仓时可继续SELL加空
+- 趋势强劲时果断加仓，弱势时观望或反向操作
 - 账户余额充足时更应主动交易，余额不足时谨慎观望
 - 仅在信号完全矛盾或余额不足时 → HOLD
 
-记住：宁愿多交易，不要错过机会。小波动也可以是入场信号。
+**交易数量决策**:
+- 你需要根据信号强度和账户余额决定交易数量(amount)
+- 信号强(HIGH) → 用接近最大值
+- 信号中(MEDIUM) → 用中等仓位
+- 信号弱(LOW) → 用最小值或接近最小值
+- 必须在 [{:.4}, {:.4}] 范围内
+
+记住：宁愿多交易，不要错过机会。小波动也可以是入场信号。支持加仓放大收益。
 
 严格返回JSON:
-{{"signal": "BUY"|"SELL"|"HOLD", "reason": "核心逻辑", "confidence": "HIGH"|"MEDIUM"|"LOW"}}"#,
+{{"signal": "BUY"|"SELL"|"HOLD", "amount": 0.001, "reason": "核心逻辑", "confidence": "HIGH"|"MEDIUM"|"LOW"}}"#,
         kline_summary,
         ma_trend,
         price_vs_ma5,
@@ -134,7 +146,11 @@ fn build_prompt(
         indicators.price_change_3,
         volume_status,
         position_risk,
-        account.availableBalance
+        account.availableBalance,
+        min_amount,
+        max_amount,
+        min_amount,
+        max_amount
     )
 }
 
@@ -144,9 +160,11 @@ pub async fn analyze(
     indicators: &TechnicalIndicators,
     position: &Option<Position>,
     account: &AccountInfo,
+    min_amount: f64,
+    max_amount: f64,
     api_key: &str,
 ) -> Result<TradingDecision> {
-    let prompt = build_prompt(klines, indicators, position, account);
+    let prompt = build_prompt(klines, indicators, position, account, min_amount, max_amount);
 
     let config = OpenAIConfig::new()
         .with_api_key(api_key)

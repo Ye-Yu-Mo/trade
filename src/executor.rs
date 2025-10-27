@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<Sha256>;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[allow(non_snake_case)]
 pub struct AccountInfo {
     pub totalWalletBalance: String,
@@ -312,6 +312,7 @@ pub async fn execute_decision(
     current_position: &Option<Position>,
     current_price: f64,
     trade_amount: f64,
+    max_position: f64,
     api_key: &str,
     secret: &str,
 ) -> Result<TradeResult> {
@@ -362,18 +363,40 @@ pub async fn execute_decision(
                         order_details: Some(format!("平空:{}, 开多:{}", close_info, open_info)),
                     })
                 }
-                Some(_) => {
-                    // 已持有多仓，不重复开仓
-                    Ok(TradeResult {
-                        symbol: symbol.to_string(),
-                        action: TradeAction::Hold,
-                        price: current_price,
-                        amount: 0.0,
-                        timestamp,
-                        reason: "已持有多仓，保持".to_string(),
-                        pnl: None,
-                        order_details: None,
-                    })
+                Some(pos) => {
+                    // 已持有多仓 → 检查是否可以加仓
+                    let new_total = pos.amount + trade_amount;
+                    if new_total > max_position {
+                        Ok(TradeResult {
+                            symbol: symbol.to_string(),
+                            action: TradeAction::Hold,
+                            price: current_price,
+                            amount: 0.0,
+                            timestamp,
+                            reason: format!(
+                                "已达最大持仓 {:.4}/{:.4}，无法加仓",
+                                pos.amount, max_position
+                            ),
+                            pnl: None,
+                            order_details: None,
+                        })
+                    } else {
+                        // 加仓
+                        let order_info = open_long(symbol, trade_amount, api_key, secret).await?;
+                        Ok(TradeResult {
+                            symbol: symbol.to_string(),
+                            action: TradeAction::OpenLong,
+                            price: current_price,
+                            amount: trade_amount,
+                            timestamp,
+                            reason: format!(
+                                "{} (加仓: {:.4} → {:.4})",
+                                decision.reason, pos.amount, new_total
+                            ),
+                            pnl: None,
+                            order_details: Some(order_info),
+                        })
+                    }
                 }
             }
         }
@@ -409,18 +432,40 @@ pub async fn execute_decision(
                         order_details: Some(format!("平多:{}, 开空:{}", close_info, open_info)),
                     })
                 }
-                Some(_) => {
-                    // 已持有空仓，不重复开仓
-                    Ok(TradeResult {
-                        symbol: symbol.to_string(),
-                        action: TradeAction::Hold,
-                        price: current_price,
-                        amount: 0.0,
-                        timestamp,
-                        reason: "已持有空仓，保持".to_string(),
-                        pnl: None,
-                        order_details: None,
-                    })
+                Some(pos) => {
+                    // 已持有空仓 → 检查是否可以加仓
+                    let new_total = pos.amount + trade_amount;
+                    if new_total > max_position {
+                        Ok(TradeResult {
+                            symbol: symbol.to_string(),
+                            action: TradeAction::Hold,
+                            price: current_price,
+                            amount: 0.0,
+                            timestamp,
+                            reason: format!(
+                                "已达最大持仓 {:.4}/{:.4}，无法加仓",
+                                pos.amount, max_position
+                            ),
+                            pnl: None,
+                            order_details: None,
+                        })
+                    } else {
+                        // 加仓
+                        let order_info = open_short(symbol, trade_amount, api_key, secret).await?;
+                        Ok(TradeResult {
+                            symbol: symbol.to_string(),
+                            action: TradeAction::OpenShort,
+                            price: current_price,
+                            amount: trade_amount,
+                            timestamp,
+                            reason: format!(
+                                "{} (加仓: {:.4} → {:.4})",
+                                decision.reason, pos.amount, new_total
+                            ),
+                            pnl: None,
+                            order_details: Some(order_info),
+                        })
+                    }
                 }
             }
         }

@@ -98,6 +98,12 @@ pub struct StrategyAdvice {
     pub reasoning: String,                 // 策略逻辑
     pub timing_score: u8,                  // 时机评分 1-10
     pub target_side: Option<PositionSide>, // 建议持仓方向
+    #[serde(default)]
+    pub target_position_pct: Option<f64>, // 目标仓位占权益比例 0-1
+    #[serde(default)]
+    pub stop_loss_pct: Option<f64>, // 建议止损百分比 (负值)
+    #[serde(default)]
+    pub take_profit_pct: Option<f64>, // 建议止盈百分比 (正值)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

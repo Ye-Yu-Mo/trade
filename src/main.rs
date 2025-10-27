@@ -9,8 +9,9 @@ mod state;
 mod types;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use dotenvy::dotenv;
-use futures::future::{join_all, try_join_all};
+use futures::future::try_join_all;
 use log::{error, info, warn};
 use std::env;
 use tokio::time::{interval, Duration};
@@ -27,6 +28,53 @@ struct SymbolAnalysis {
     symbol: String,
     position: Option<types::Position>,
     market_report: types::MarketReport,
+}
+
+#[derive(Clone, Debug)]
+struct SymbolCacheEntry {
+    position: Option<types::Position>,
+    last_updated: Option<DateTime<Utc>>,
+}
+
+impl SymbolCacheEntry {
+    fn empty() -> Self {
+        SymbolCacheEntry {
+            position: None,
+            last_updated: None,
+        }
+    }
+
+    fn update(&mut self, position: Option<types::Position>) {
+        self.position = position;
+        self.last_updated = Some(Utc::now());
+    }
+
+    fn should_use_cache(&self, now: DateTime<Utc>, max_age_secs: u64) -> bool {
+        match self.last_updated {
+            Some(last) => now.signed_duration_since(last).num_seconds() <= max_age_secs as i64,
+            None => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AccountCache {
+    info: executor::AccountInfo,
+    last_updated: DateTime<Utc>,
+}
+
+impl AccountCache {
+    fn new(info: executor::AccountInfo) -> Self {
+        AccountCache {
+            info,
+            last_updated: Utc::now(),
+        }
+    }
+
+    fn update(&mut self, info: executor::AccountInfo) {
+        self.info = info;
+        self.last_updated = Utc::now();
+    }
 }
 
 fn adjust_trade_quantity(
@@ -252,13 +300,11 @@ async fn execute_symbol_cycle(
     allocated_max_amount: f64,
     allocated_balance: f64,
     constraints: &executor::SymbolConstraints,
+    account: &executor::AccountInfo,
     config: &Config,
 ) -> Result<SymbolCycleResult> {
     info!("--- 决策执行: {} ---", analysis.symbol);
 
-    // 获取实时账户信息
-    let account =
-        executor::get_account_info(&config.binance_api_key, &config.binance_secret).await?;
     info!("账户: 可用余额 {} USDT", account.availableBalance);
 
     match &analysis.position {
@@ -283,6 +329,15 @@ async fn execute_symbol_cycle(
         "策略研究员: {:?} | 时机评分: {}/10 | {}",
         strategy.action, strategy.timing_score, strategy.reasoning
     );
+    if let Some(pct) = strategy.target_position_pct {
+        info!("目标仓位占比: {:.2}%", pct * 100.0);
+    }
+    if let Some(sl) = strategy.stop_loss_pct {
+        info!("建议止损: {:.2}%", sl * 100.0);
+    }
+    if let Some(tp) = strategy.take_profit_pct {
+        info!("建议止盈: {:.2}%", tp * 100.0);
+    }
 
     // 风险管理员
     let risk = multi_agent::risk_manager_assess(
@@ -348,7 +403,7 @@ async fn execute_symbol_cycle(
                 );
                 return Ok(SymbolCycleResult {
                     traded: false,
-                    account_snapshot: Some(account),
+                    account_snapshot: Some(account.clone()),
                     position_snapshot: analysis.position.clone(),
                 });
             }
@@ -434,10 +489,8 @@ async fn run_portfolio_cycle(
     config: &Config,
     interval_str: &str,
     constraints_map: &std::collections::HashMap<String, executor::SymbolConstraints>,
-    symbols_cache: &mut std::collections::HashMap<
-        String,
-        (Option<executor::AccountInfo>, Option<types::Position>, bool),
-    >,
+    symbols_cache: &mut std::collections::HashMap<String, SymbolCacheEntry>,
+    account_cache: &mut Option<AccountCache>,
 ) -> Result<bool> {
     info!("============================================================");
     info!(
@@ -448,13 +501,17 @@ async fn run_portfolio_cycle(
 
     // 1. 获取所有标的的行情分析
     info!("=== 第一阶段：行情分析 (并行) ===");
+    let now = Utc::now();
     let mut analysis_futures = Vec::new();
     for symbol in &config.trade_symbols {
         let symbol_clone = symbol.clone();
-        let (_, cached_position, use_cache) = symbols_cache
-            .get(symbol)
-            .cloned()
-            .unwrap_or((None, None, false));
+        let (cached_position, use_cache) = match symbols_cache.get(symbol) {
+            Some(entry) => (
+                entry.position.clone(),
+                entry.should_use_cache(now, config.trade_interval_secs),
+            ),
+            None => (None, false),
+        };
 
         analysis_futures.push(analyze_symbol(
             symbol_clone,
@@ -474,10 +531,15 @@ async fn run_portfolio_cycle(
         .map(|a| (a.symbol.clone(), a.market_report.clone()))
         .collect();
 
-    let account =
+    let mut current_account =
         executor::get_account_info(&config.binance_api_key, &config.binance_secret).await?;
-    let total_balance: f64 = account.availableBalance.parse().unwrap_or(0.0);
+    let total_balance: f64 = current_account.availableBalance.parse().unwrap_or(0.0);
     info!("总可用资金: {} USDT", total_balance);
+
+    match account_cache {
+        Some(cache) => cache.update(current_account.clone()),
+        None => *account_cache = Some(AccountCache::new(current_account.clone())),
+    }
 
     let mut portfolio_allocation = multi_agent::portfolio_coordinator_allocate(
         &symbols_reports,
@@ -517,24 +579,23 @@ async fn run_portfolio_cycle(
         .collect();
 
     let mut any_traded = false;
-    let mut execution_futures = Vec::new();
 
     for alloc in &portfolio_allocation.allocations {
         let analysis = match analysis_map.remove(&alloc.symbol) {
             Some(a) => a,
             None => {
                 error!("未找到标的 {} 的分析结果，跳过执行", alloc.symbol);
-                symbols_cache.insert(alloc.symbol.clone(), (None, None, false));
+                symbols_cache.remove(&alloc.symbol);
                 continue;
             }
         };
 
         if alloc.priority == types::AllocationPriority::Skip {
             info!("跳过标的: {} (优先级: Skip)", alloc.symbol);
-            symbols_cache.insert(
-                alloc.symbol.clone(),
-                (None, analysis.position.clone(), analysis.position.is_some()),
-            );
+            symbols_cache
+                .entry(alloc.symbol.clone())
+                .or_insert_with(SymbolCacheEntry::empty)
+                .update(analysis.position.clone());
             continue;
         }
 
@@ -544,17 +605,20 @@ async fn run_portfolio_cycle(
             Some(c) => *c,
             None => {
                 error!("缺少交易约束，跳过标的 {}", symbol);
-                symbols_cache.insert(symbol.clone(), (None, None, false));
+                symbols_cache
+                    .entry(symbol.clone())
+                    .or_insert_with(SymbolCacheEntry::empty)
+                    .update(None);
                 continue;
             }
         };
 
         if allocated_balance <= 0.0 {
             warn!("分配资金为零，跳过标的 {}", symbol);
-            symbols_cache.insert(
-                symbol.clone(),
-                (None, analysis.position.clone(), analysis.position.is_some()),
-            );
+            symbols_cache
+                .entry(symbol.clone())
+                .or_insert_with(SymbolCacheEntry::empty)
+                .update(analysis.position.clone());
             continue;
         }
 
@@ -564,10 +628,10 @@ async fn run_portfolio_cycle(
         }
         if max_amount <= 0.0 {
             warn!("最大持仓上限为零，跳过标的 {}", symbol);
-            symbols_cache.insert(
-                symbol.clone(),
-                (None, analysis.position.clone(), analysis.position.is_some()),
-            );
+            symbols_cache
+                .entry(symbol.clone())
+                .or_insert_with(SymbolCacheEntry::empty)
+                .update(analysis.position.clone());
             continue;
         }
 
@@ -576,58 +640,67 @@ async fn run_portfolio_cycle(
                 "最小下单量 {:.6} 超过最大允许 {:.6}，跳过标的 {}",
                 constraint.min_qty, max_amount, symbol
             );
-            symbols_cache.insert(
-                symbol.clone(),
-                (None, analysis.position.clone(), analysis.position.is_some()),
-            );
+            symbols_cache
+                .entry(symbol.clone())
+                .or_insert_with(SymbolCacheEntry::empty)
+                .update(analysis.position.clone());
             continue;
         }
 
-        execution_futures.push(async move {
-            let exec = execute_symbol_cycle(
-                &analysis,
-                max_amount,
-                allocated_balance,
-                &constraint,
-                config,
-            )
-            .await;
-            (symbol, exec, analysis)
-        });
-    }
-
-    let execution_results = join_all(execution_futures).await;
-
-    for (symbol, outcome, analysis) in execution_results {
-        match outcome {
+        match execute_symbol_cycle(
+            &analysis,
+            max_amount,
+            allocated_balance,
+            &constraint,
+            &current_account,
+            config,
+        )
+        .await
+        {
             Ok(result) => {
                 if result.traded {
                     any_traded = true;
                 }
 
-                let cache_account = result.account_snapshot.clone();
-                let cache_position = if let Some(pos) = result.position_snapshot.clone() {
-                    Some(pos)
-                } else {
-                    analysis.position.clone()
-                };
-                let use_cache = cache_account.is_some() || cache_position.is_some();
+                if let Some(snapshot) = result.account_snapshot.clone() {
+                    current_account = snapshot;
+                    match account_cache {
+                        Some(cache) => cache.update(current_account.clone()),
+                        None => *account_cache = Some(AccountCache::new(current_account.clone())),
+                    }
+                }
 
-                symbols_cache.insert(symbol, (cache_account, cache_position, use_cache));
+                let cached_position = result
+                    .position_snapshot
+                    .clone()
+                    .or_else(|| analysis.position.clone());
+
+                symbols_cache
+                    .entry(symbol)
+                    .or_insert_with(SymbolCacheEntry::empty)
+                    .update(cached_position);
             }
             Err(e) => {
                 error!("标的 {} 交易周期失败: {:#}", symbol, e);
-                symbols_cache.insert(symbol, (None, None, false));
+                symbols_cache
+                    .entry(symbol)
+                    .or_insert_with(SymbolCacheEntry::empty)
+                    .update(analysis.position.clone());
             }
         }
     }
 
     // 对未参与决策的分析结果更新缓存
     for (symbol, analysis) in analysis_map.into_iter() {
-        symbols_cache.insert(
-            symbol,
-            (None, analysis.position.clone(), analysis.position.is_some()),
-        );
+        symbols_cache
+            .entry(symbol)
+            .or_insert_with(SymbolCacheEntry::empty)
+            .update(analysis.position.clone());
+    }
+
+    match account_cache {
+        Some(cache) => cache.update(current_account.clone()),
+        None => *account_cache = Some(AccountCache::new(current_account.clone())),
     }
 
     Ok(any_traded)
@@ -753,9 +826,10 @@ async fn main() -> Result<()> {
         _ => "1m",
     };
 
-    // 初始化多标的缓存状态
-    // HashMap<Symbol, (AccountInfo, Position, use_cache)>
-    let mut symbols_cache = std::collections::HashMap::new();
+    // 初始化缓存状态
+    let mut symbols_cache: std::collections::HashMap<String, SymbolCacheEntry> =
+        std::collections::HashMap::new();
+    let mut account_cache: Option<AccountCache> = None;
 
     // 主循环
     let mut ticker = interval(Duration::from_secs(config.trade_interval_secs));
@@ -768,6 +842,7 @@ async fn main() -> Result<()> {
             interval_str,
             &symbol_constraints,
             &mut symbols_cache,
+            &mut account_cache,
         )
         .await
         {
@@ -778,6 +853,7 @@ async fn main() -> Result<()> {
                 error!("投资组合交易周期失败: {:#}", e);
                 // 错误时清空所有缓存
                 symbols_cache.clear();
+                account_cache = None;
             }
         }
     }

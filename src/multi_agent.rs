@@ -110,6 +110,20 @@ fn get_market_analyst_system_prompt() -> &'static str {
 **禁止输出任何JSON之外的内容。**"#
 }
 
+fn structured_prompt(
+    header: &str,
+    payload: &serde_json::Value,
+    output_format: &str,
+) -> Result<String> {
+    let data = serde_json::to_string_pretty(payload)?;
+    Ok(format!(
+        "{header}\n数据:\n{data}\n\n输出格式:\n{output_format}",
+        header = header,
+        data = data,
+        output_format = output_format
+    ))
+}
+
 fn build_risk_manager_prompt(
     symbol: &str,
     market_report: &MarketReport,
@@ -151,23 +165,17 @@ fn build_risk_manager_prompt(
         }
     });
 
-    let data = serde_json::to_string_pretty(&payload)?;
-
-    Ok(format!(
-        r#"输入包含账户资源、当前仓位、策略建议与市场分析（JSON），请评估风险并给出审批结论。
-数据:
-{}
-
-输出格式:
-{{
+    structured_prompt(
+        "输入包含账户资源、当前仓位、策略建议与市场分析（JSON），请评估风险并给出审批结论。",
+        &payload,
+        r#"{
   "risk_level": "low" | "medium" | "high",
   "suggested_amount": 数字,
   "approval": "approved" | "adjusted" | "rejected",
   "warnings": ["可选风险提示"],
   "reason": "风险评估结论，<=50字"
-}}"#,
-        data
-    ))
+}"#,
+    )
 }
 
 fn build_market_analyst_prompt(
@@ -279,24 +287,18 @@ fn build_market_analyst_prompt(
         }
     });
 
-    let data = serde_json::to_string_pretty(&payload)?;
-
-    Ok(format!(
-        r#"根据下面的 JSON 数据分析市场结构，并仅输出 JSON 响应。
-数据:
-{}
-
-输出格式:
-{{
+    structured_prompt(
+        "根据下面的 JSON 数据分析市场结构，并仅输出 JSON 响应。",
+        &payload,
+        r#"{
   "trend": "bullish" | "bearish" | "neutral",
   "strength": "strong" | "medium" | "weak",
   "market_phase": "accumulation" | "markup" | "distribution" | "markdown",
   "support": 0.0,
   "resistance": 0.0,
   "analysis": "核心判断，<=50字"
-}}"#,
-        data
-    ))
+}"#,
+    )
 }
 
 pub async fn market_analyst_analyze(
@@ -391,6 +393,12 @@ fn get_strategy_researcher_system_prompt() -> &'static str {
 * 看空环境 → target_side: Short
 * 观望或平仓 → target_side: null
 
+**第五层：仓位与风险控制**
+
+* 给出目标仓位占比 target_position_pct (0-1之间)，结合趋势/账户规模
+* 设置止损 stop_loss_pct（负值，例如-0.03表示-3%），没有则留空
+* 设置止盈 take_profit_pct（正值，例如0.07表示+7%），没有则留空
+
 ---
 
 ## 输出要求
@@ -401,7 +409,10 @@ fn get_strategy_researcher_system_prompt() -> &'static str {
   "action": "open_long"|"open_short"|"add_position"|"close_position"|"hold",
   "reasoning": "策略逻辑，50字内",
   "timing_score": 8,
-  "target_side": "Long"|"Short"|null
+  "target_side": "Long"|"Short"|null,
+  "target_position_pct": 0.35,        // 0-1 之间，可选
+  "stop_loss_pct": -0.04,              // 以-0.04表示-4%止损，可选
+  "take_profit_pct": 0.08             // 以0.08表示+8%止盈，可选
 }
 
 **禁止输出任何JSON之外的内容。**"#
@@ -418,22 +429,19 @@ fn build_strategy_researcher_prompt(
         "position": position,
     });
 
-    let data = serde_json::to_string_pretty(&payload)?;
-
-    Ok(format!(
-        r#"输入是上一阶段的市场分析与当前持仓，全部以 JSON 形式给出。请基于这些数据输出最合理的策略建议。
-数据:
-{}
-
-输出格式:
-{{
+    structured_prompt(
+        "输入是上一阶段的市场分析与当前持仓，全部以 JSON 形式给出。请基于这些数据输出最合理的策略建议。",
+        &payload,
+        r#"{
   "action": "open_long" | "open_short" | "add_position" | "close_position" | "hold",
   "reasoning": "策略逻辑，<=50字",
   "timing_score": 1-10 的整数,
-  "target_side": "Long" | "Short" | null
-}}"#,
-        data
-    ))
+  "target_side": "Long" | "Short" | null,
+  "target_position_pct": 0.4,    // 可选，0-1之间，表示目标仓位权益占比
+  "stop_loss_pct": -0.03,         // 可选，负值代表止损百分比
+  "take_profit_pct": 0.08        // 可选，正值代表止盈百分比
+}"#,
+    )
 }
 
 pub async fn strategy_researcher_suggest(
@@ -694,22 +702,16 @@ fn build_trade_executor_prompt(
         "risk": risk,
     });
 
-    let data = serde_json::to_string_pretty(&payload)?;
-
-    Ok(format!(
-        r#"根据三方的结构化汇总（JSON）做出最终交易决定。
-数据:
-{}
-
-输出格式:
-{{
+    structured_prompt(
+        "根据三方的结构化汇总（JSON）做出最终交易决定。",
+        &payload,
+        r#"{
   "signal": "BUY" | "SELL" | "HOLD",
   "amount": 数字,
   "confidence": "HIGH" | "MEDIUM" | "LOW",
   "reason": "综合判断，<=50字"
-}}"#,
-        data
-    ))
+}"#,
+    )
 }
 
 pub async fn trade_executor_decide(
@@ -848,24 +850,18 @@ fn build_portfolio_coordinator_prompt(
         "reports": simplified,
     });
 
-    let data = serde_json::to_string_pretty(&payload)?;
-
-    Ok(format!(
-        r#"以下是每个标的的结构化行情摘要，请制定资金分配方案。
-数据:
-{}
-
-输出格式:
-{{
+    structured_prompt(
+        "以下是每个标的的结构化行情摘要，请制定资金分配方案。",
+        &payload,
+        r#"{
   "allocations": [
-    {{"symbol": "BTCUSDT", "allocated_balance": 0.0, "weight": 0.0, "priority": "high"|"medium"|"low"|"skip", "max_amount_override": 0.0|null }}
+    {"symbol": "BTCUSDT", "allocated_balance": 0.0, "weight": 0.0, "priority": "high"|"medium"|"low"|"skip", "max_amount_override": 0.0|null }
   ],
   "total_available": 数字,
   "strategy": "balanced" | "aggressive" | "conservative",
   "reasoning": "<=80字"
-}}"#,
-        data
-    ))
+}"#,
+    )
 }
 
 pub async fn portfolio_coordinator_allocate(

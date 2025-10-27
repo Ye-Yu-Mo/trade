@@ -151,6 +151,14 @@ impl Config {
             portfolio_mode: env::var("PORTFOLIO_MODE").unwrap_or_else(|_| "balanced".to_string()),
         })
     }
+
+    fn desired_portfolio_strategy(&self) -> types::PortfolioStrategy {
+        match self.portfolio_mode.to_lowercase().as_str() {
+            "aggressive" => types::PortfolioStrategy::Aggressive,
+            "conservative" => types::PortfolioStrategy::Conservative,
+            _ => types::PortfolioStrategy::Balanced,
+        }
+    }
 }
 
 // 并行阶段：每个标的的行情与持仓分析
@@ -320,12 +328,14 @@ async fn execute_symbol_cycle(
     let mut position_snapshot = analysis.position.clone();
 
     if decision.signal != types::Signal::Hold {
-        let price = market::fetch_current_price(&analysis.symbol).await?;
+        let raw_price = market::fetch_current_price(&analysis.symbol).await?;
+        let quoted_price = executor::quantize_price(raw_price, constraints.tick_size);
+        info!("价格对齐: 原始 {:.6} → {:.6}", raw_price, quoted_price);
         let maybe_trade_amount = adjust_trade_quantity(
             decision.amount,
             allocated_max_amount,
             allocated_balance,
-            price,
+            quoted_price,
             constraints,
         );
 
@@ -334,7 +344,7 @@ async fn execute_symbol_cycle(
             None => {
                 warn!(
                     "无法满足交易约束，保持观望: 建议 {:.6}, 分配上限 {:.6}, 分配资金 {:.2} USDT, 价格 {:.6}",
-                    decision.amount, allocated_max_amount, allocated_balance, price
+                    decision.amount, allocated_max_amount, allocated_balance, quoted_price
                 );
                 return Ok(SymbolCycleResult {
                     traded: false,
@@ -355,7 +365,7 @@ async fn execute_symbol_cycle(
             &analysis.symbol,
             &decision,
             &analysis.position,
-            price,
+            quoted_price,
             trade_amount,
             config.max_position,
             &config.binance_api_key,
@@ -398,7 +408,7 @@ async fn execute_symbol_cycle(
                 let failed_result = types::TradeResult {
                     symbol: analysis.symbol.clone(),
                     action: types::TradeAction::Hold,
-                    price,
+                    price: quoted_price,
                     amount: 0.0,
                     timestamp: chrono::Utc::now().timestamp(),
                     reason: format!("交易失败: {:#}", e),
@@ -469,13 +479,22 @@ async fn run_portfolio_cycle(
     let total_balance: f64 = account.availableBalance.parse().unwrap_or(0.0);
     info!("总可用资金: {} USDT", total_balance);
 
-    let portfolio_allocation = multi_agent::portfolio_coordinator_allocate(
+    let mut portfolio_allocation = multi_agent::portfolio_coordinator_allocate(
         &symbols_reports,
         total_balance,
         &config.portfolio_mode,
         &config.deepseek_api_key,
     )
     .await?;
+
+    let desired_strategy = config.desired_portfolio_strategy();
+    if portfolio_allocation.strategy != desired_strategy {
+        warn!(
+            "组合策略由配置 {} 指定为 {:?}，LLM 返回 {:?}，强制使用配置策略",
+            config.portfolio_mode, desired_strategy, portfolio_allocation.strategy
+        );
+        portfolio_allocation.strategy = desired_strategy;
+    }
 
     info!("组合策略: {:?}", portfolio_allocation.strategy);
     info!("分配理由: {}", portfolio_allocation.reasoning);
@@ -519,7 +538,6 @@ async fn run_portfolio_cycle(
             continue;
         }
 
-        let max_amount = alloc.max_amount_override.unwrap_or(config.max_position);
         let allocated_balance = alloc.allocated_balance;
         let symbol = alloc.symbol.clone();
         let constraint = match constraints_map.get(&symbol) {
@@ -530,6 +548,40 @@ async fn run_portfolio_cycle(
                 continue;
             }
         };
+
+        if allocated_balance <= 0.0 {
+            warn!("分配资金为零，跳过标的 {}", symbol);
+            symbols_cache.insert(
+                symbol.clone(),
+                (None, analysis.position.clone(), analysis.position.is_some()),
+            );
+            continue;
+        }
+
+        let mut max_amount = alloc.max_amount_override.unwrap_or(config.max_position);
+        if let Some(max_qty) = constraint.max_qty {
+            max_amount = max_amount.min(max_qty);
+        }
+        if max_amount <= 0.0 {
+            warn!("最大持仓上限为零，跳过标的 {}", symbol);
+            symbols_cache.insert(
+                symbol.clone(),
+                (None, analysis.position.clone(), analysis.position.is_some()),
+            );
+            continue;
+        }
+
+        if constraint.min_qty > max_amount {
+            warn!(
+                "最小下单量 {:.6} 超过最大允许 {:.6}，跳过标的 {}",
+                constraint.min_qty, max_amount, symbol
+            );
+            symbols_cache.insert(
+                symbol.clone(),
+                (None, analysis.position.clone(), analysis.position.is_some()),
+            );
+            continue;
+        }
 
         execution_futures.push(async move {
             let exec = execute_symbol_cycle(

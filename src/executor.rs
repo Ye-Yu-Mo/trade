@@ -182,11 +182,20 @@ pub fn quantize_up(value: f64, step: f64) -> f64 {
     (steps * step).max(0.0)
 }
 
+pub fn quantize_price(price: f64, tick_size: f64) -> f64 {
+    if tick_size <= 0.0 {
+        return price;
+    }
+    let steps = (price / tick_size).round();
+    (steps * tick_size).max(0.0)
+}
+
 // Task 5.1: 查询当前持仓
 #[derive(Debug, Deserialize)]
 #[allow(non_snake_case)]
 struct PositionRisk {
     symbol: String,
+    positionSide: String,
     positionAmt: String,
     entryPrice: String,
     unRealizedProfit: String,
@@ -214,27 +223,48 @@ pub async fn get_position(symbol: &str, api_key: &str, secret: &str) -> Result<O
         .await
         .context("解析持仓数据失败")?;
 
+    let mut best_position: Option<Position> = None;
+
     for pos in positions {
-        if pos.symbol == symbol {
-            let amount: f64 = pos.positionAmt.parse().unwrap_or(0.0);
-            if amount.abs() < 0.0001 {
-                return Ok(None); // 空仓
+        if pos.symbol != symbol {
+            continue;
+        }
+
+        let amount: f64 = pos.positionAmt.parse().unwrap_or(0.0);
+        if amount.abs() < 0.0001 {
+            continue;
+        }
+
+        let side = match pos.positionSide.as_str() {
+            "LONG" => PositionSide::Long,
+            "SHORT" => PositionSide::Short,
+            _ => {
+                if amount > 0.0 {
+                    PositionSide::Long
+                } else {
+                    PositionSide::Short
+                }
             }
-            let side = if amount > 0.0 {
-                PositionSide::Long
-            } else {
-                PositionSide::Short
-            };
-            return Ok(Some(Position {
-                side,
-                amount: amount.abs(),
-                entry_price: pos.entryPrice.parse().unwrap_or(0.0),
-                unrealized_pnl: pos.unRealizedProfit.parse().unwrap_or(0.0),
-            }));
+        };
+
+        let candidate = Position {
+            side,
+            amount: amount.abs(),
+            entry_price: pos.entryPrice.parse().unwrap_or(0.0),
+            unrealized_pnl: pos.unRealizedProfit.parse().unwrap_or(0.0),
+        };
+
+        let replace = match &best_position {
+            None => true,
+            Some(existing) => candidate.amount > existing.amount,
+        };
+
+        if replace {
+            best_position = Some(candidate);
         }
     }
 
-    Ok(None)
+    Ok(best_position)
 }
 
 // 获取账户信息
@@ -417,7 +447,7 @@ pub async fn execute_decision(
     symbol: &str,
     decision: &TradingDecision,
     current_position: &Option<Position>,
-    current_price: f64,
+    execution_price: f64,
     trade_amount: f64,
     max_position: f64,
     api_key: &str,
@@ -430,7 +460,7 @@ pub async fn execute_decision(
             return Ok(TradeResult {
                 symbol: symbol.to_string(),
                 action: TradeAction::Hold,
-                price: current_price,
+                price: execution_price,
                 amount: 0.0,
                 timestamp,
                 reason: decision.reason.clone(),
@@ -446,7 +476,7 @@ pub async fn execute_decision(
                     Ok(TradeResult {
                         symbol: symbol.to_string(),
                         action: TradeAction::OpenLong,
-                        price: current_price,
+                        price: execution_price,
                         amount: trade_amount,
                         timestamp,
                         reason: decision.reason.clone(),
@@ -457,12 +487,12 @@ pub async fn execute_decision(
                 Some(pos) if pos.side == PositionSide::Short => {
                     // 持有空仓 → 平空 → 开多
                     let close_info = close_short(symbol, pos.amount, api_key, secret).await?;
-                    let pnl = (pos.entry_price - current_price) * pos.amount;
+                    let pnl = (pos.entry_price - execution_price) * pos.amount;
                     let open_info = open_long(symbol, trade_amount, api_key, secret).await?;
                     Ok(TradeResult {
                         symbol: symbol.to_string(),
                         action: TradeAction::OpenLong,
-                        price: current_price,
+                        price: execution_price,
                         amount: trade_amount,
                         timestamp,
                         reason: format!("{} (平空仓盈亏: {:.2})", decision.reason, pnl),
@@ -477,7 +507,7 @@ pub async fn execute_decision(
                         Ok(TradeResult {
                             symbol: symbol.to_string(),
                             action: TradeAction::Hold,
-                            price: current_price,
+                            price: execution_price,
                             amount: 0.0,
                             timestamp,
                             reason: format!(
@@ -493,7 +523,7 @@ pub async fn execute_decision(
                         Ok(TradeResult {
                             symbol: symbol.to_string(),
                             action: TradeAction::OpenLong,
-                            price: current_price,
+                            price: execution_price,
                             amount: trade_amount,
                             timestamp,
                             reason: format!(
@@ -515,7 +545,7 @@ pub async fn execute_decision(
                     Ok(TradeResult {
                         symbol: symbol.to_string(),
                         action: TradeAction::OpenShort,
-                        price: current_price,
+                        price: execution_price,
                         amount: trade_amount,
                         timestamp,
                         reason: decision.reason.clone(),
@@ -526,12 +556,12 @@ pub async fn execute_decision(
                 Some(pos) if pos.side == PositionSide::Long => {
                     // 持有多仓 → 平多 → 开空
                     let close_info = close_long(symbol, pos.amount, api_key, secret).await?;
-                    let pnl = (current_price - pos.entry_price) * pos.amount;
+                    let pnl = (execution_price - pos.entry_price) * pos.amount;
                     let open_info = open_short(symbol, trade_amount, api_key, secret).await?;
                     Ok(TradeResult {
                         symbol: symbol.to_string(),
                         action: TradeAction::OpenShort,
-                        price: current_price,
+                        price: execution_price,
                         amount: trade_amount,
                         timestamp,
                         reason: format!("{} (平多仓盈亏: {:.2})", decision.reason, pnl),
@@ -546,7 +576,7 @@ pub async fn execute_decision(
                         Ok(TradeResult {
                             symbol: symbol.to_string(),
                             action: TradeAction::Hold,
-                            price: current_price,
+                            price: execution_price,
                             amount: 0.0,
                             timestamp,
                             reason: format!(
@@ -562,7 +592,7 @@ pub async fn execute_decision(
                         Ok(TradeResult {
                             symbol: symbol.to_string(),
                             action: TradeAction::OpenShort,
-                            price: current_price,
+                            price: execution_price,
                             amount: trade_amount,
                             timestamp,
                             reason: format!(

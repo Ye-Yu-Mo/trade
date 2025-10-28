@@ -445,9 +445,8 @@ async fn establish_account_stream(
                     Some(Ok(Message::Pong(_))) => {
                         // ignore
                     }
-                    Some(Ok(Message::Binary(_))) => {
-                        // no-op
-                    }
+                    Some(Ok(Message::Binary(_))) => {}
+                    Some(Ok(Message::Frame(_))) => {}
                     Some(Ok(Message::Close(frame))) => {
                         return Err(anyhow!("账户 WebSocket 主动关闭: {:?}", frame));
                     }

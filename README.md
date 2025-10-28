@@ -1,213 +1,295 @@
-# 单智能体加密货币自动交易系统
+# Multi-Agent Cryptocurrency Auto Trading System
 
-基于 DeepSeek 的单一决策流合约交易机器人，使用 Rust 实现，在 Binance 测试网上对 BTCUSDT 和 ETHUSDT 进行自动交易。
+A multi-agent collaborative portfolio trading bot built with Rust, using DeepSeek LLM for decision making, and running on Binance testnet for automated cryptocurrency trading.
 
-## 核心特性
+[English Version](README.md) | [中文版本](README_ZH.md)
 
-- **单体架构**：数据获取 → 技术指标计算 → LLM 决策 → 交易执行 → 日志记录
-- **专业提示词**：基于"交易分析师"角色，理性、数据驱动、风险优先
-- **合约交易**：支持做多/做空，自动处理多空切换
-- **技术指标**：SMA(5/20)、价格变化率、成交量比
-- **风险控制**：持仓监控、盈亏跟踪、错误重试
+## Core Features
 
-## 快速开始
+- **Multi-Agent Architecture**: Market Analyst → Strategy Researcher → Risk Manager → Trade Executor → Portfolio Coordinator
+- **Portfolio Management**: Support for multiple symbols with intelligent fund allocation
+- **Professional Role Division**: Each agent specializes in specific domains, collaborative decision making
+- **Contract Trading**: Support for long/short positions, automatic position switching
+- **Technical Indicators**: SMA(5/20/50/100), Price Change Rate, ATR, Volume Ratio
+- **Risk Control**: Position monitoring, P&L tracking, fund allocation, error retry
 
-### 1. 配置环境
+## System Architecture
 
-复制环境变量模板：
+### Multi-Agent Collaboration Process
+
+```mermaid
+flowchart TD
+    A[main.rs<br/>Main Program] --> B[Phase 1: Parallel Market Analysis]
+    A --> C[Phase 2: Portfolio Fund Allocation]
+    A --> D[Phase 3: Sequential Trade Execution]
+    
+    B --> B1[Market Analyst<br/>market.rs]
+    B --> B2[Market Analyst<br/>market.rs]
+    B --> B3[Market Analyst<br/>market.rs]
+    
+    B1 --> E[MarketReport]
+    B2 --> E
+    B3 --> E
+    
+    E --> F[Portfolio Coordinator]
+    F --> G[PortfolioAllocation]
+    
+    G --> H[Strategy Researcher]
+    H --> I[StrategySuggestion]
+    
+    I --> J[Risk Manager]
+    J --> K[RiskAssessment]
+    
+    K --> L[Trade Executor<br/>executor.rs]
+    L --> M[TradingDecision]
+    L --> N[TradeResult]
+    
+    M --> O[state.rs<br/>Logging]
+    N --> O
+    
+    subgraph "Parallel Execution"
+        B1
+        B2
+        B3
+    end
+    
+    subgraph "Sequential Execution"
+        H
+        J
+        L
+    end
+    
+    style A fill:#e1f5fe
+    style B1 fill:#f3e5f5
+    style B2 fill:#f3e5f5
+    style B3 fill:#f3e5f5
+    style F fill:#e8f5e8
+    style H fill:#fff3e0
+    style J fill:#ffebee
+    style L fill:#e8eaf6
+    style O fill:#f5f5f5
+```
+
+### Agent Role Division
+
+1. **Market Analyst** (`market.rs`)
+   - Fetch K-line data, calculate technical indicators
+   - Analyze market trends, strength, phases
+   - Output: `MarketReport`
+
+2. **Strategy Researcher**
+   - Develop trading strategies based on market analysis
+   - Suggest target positions, stop-loss, take-profit
+   - Output: `StrategySuggestion`
+
+3. **Risk Manager**
+   - Assess trading risks, approve strategies
+   - Calculate suggested trade quantities
+   - Output: `RiskAssessment`
+
+4. **Trade Executor** (`executor.rs`)
+   - Make final decisions based on all inputs
+   - Execute specific trading operations
+   - Output: `TradingDecision`
+
+5. **Portfolio Coordinator**
+   - Manage fund allocation across multiple symbols
+   - Develop portfolio strategies
+   - Output: `PortfolioAllocation`
+
+## Quick Start
+
+### 1. Configure Environment
+
+Copy environment template:
 ```bash
 cp .env.example .env
 ```
 
-编辑 `.env` 文件，填入以下信息：
+Edit `.env` file with your information:
 
 ```bash
-# Binance 测试网 API (从 https://testnet.binancefuture.com 获取)
+# Binance Testnet API (from https://testnet.binancefuture.com)
 BINANCE_API_KEY=your_testnet_api_key
 BINANCE_SECRET=your_testnet_secret
 BINANCE_TESTNET=true
 
-# DeepSeek API (从 https://platform.deepseek.com 获取)
+# DeepSeek API (from https://platform.deepseek.com)
 DEEPSEEK_API_KEY=your_deepseek_key
 
-# 交易配置
-TRADE_SYMBOL=BTCUSDT
-TRADE_AMOUNT=0.001
-TRADE_INTERVAL=15m  # 可选: 15m, 30m, 1h
+# Trading Configuration
+TRADE_SYMBOLS=BTCUSDT,ETHUSDT  # Multiple symbols, comma separated
+MIN_TRADE_AMOUNT=0.001  # AI decision minimum trade quantity
+MAX_TRADE_AMOUNT=0.003  # AI decision maximum trade quantity
+TRADE_INTERVAL=1m  # Options: 1m, 15m, 30m, 1h
+LEVERAGE=10  # Leverage: 1-125
+MAX_POSITION=0.005  # Maximum position per symbol
+PORTFOLIO_MODE=balanced  # Portfolio mode: balanced | aggressive | conservative
 ```
 
-### 2. 编译运行
+### 2. Build and Run
 
 ```bash
 cargo build --release
 cargo run --release
 ```
 
-### 3. 查看日志
+### 3. Check Logs
 
-程序会自动创建 `logs/` 目录：
+The program automatically creates `logs/` directory:
 
-- `logs/trades.jsonl` - 交易记录（开仓/平仓/价格/盈亏）
-- `logs/decisions.jsonl` - 决策记录（包含 HOLD 信号）
+- `logs/trades.jsonl` - Trade records (open/close positions, prices, P&L)
+- `logs/decisions.jsonl` - Decision records (including multi-agent analysis process)
+- `logs/performance.json` - Performance tracking data
 
-每行一个 JSON 对象，可用 `jq` 查看：
+Each line is a JSON object, view with `jq`:
 
 ```bash
-# 查看最近10条交易
+# View recent 10 trades
 tail -10 logs/trades.jsonl | jq
 
-# 查看所有决策
-cat logs/decisions.jsonl | jq -c '{signal: .decision.signal, reason: .decision.reason}'
+# View all decisions
+cat logs/decisions.jsonl | jq -c '{symbol: .symbol, signal: .decision.signal, reason: .decision.reason}'
+
+# View performance data
+cat logs/performance.json | jq
 ```
 
-## 系统架构
+## Multi-Agent Decision Process
 
-```
-┌─────────────────────────────────────────────┐
-│              main.rs (166行)                 │
-│  - 配置加载 (.env)                            │
-│  - 定时循环 (tokio)                           │
-│  - 错误处理 (不中断)                          │
-└──────────────┬──────────────────────────────┘
-               │
-    ┌──────────┼──────────┬──────────┬─────────┐
-    │          │          │          │         │
-    ▼          ▼          ▼          ▼         ▼
-┌────────┐ ┌─────┐ ┌──────────┐ ┌──────┐ ┌────────┐
-│ market │ │ llm │ │ executor │ │state │ │ types  │
-│ (118行)│ │(179)│ │  (267行) │ │(55行)│ │ (81行) │
-└────────┘ └─────┘ └──────────┘ └──────┘ └────────┘
-```
+### Phase 1: Parallel Market Analysis
 
-### 数据流
+Each symbol executes in parallel:
+1. **Fetch K-line Data**: 120 K-lines, calculate technical indicators
+2. **Market Analyst Decision**: Analyze trends, strength, market phases
+3. **Position Query**: Get current position status
 
-1. **market::fetch_klines()** → 获取20根K线数据
-2. **market::calculate_indicators()** → 计算 SMA、价格变化率、成交量比
-3. **executor::get_position()** → 查询当前持仓（多/空/空仓）
-4. **llm::analyze()** → 调用 DeepSeek API，返回 `{signal, reason, confidence}`
-5. **executor::execute_decision()** → 执行交易决策
-   - BUY: 开多仓（或平空后开多）
-   - SELL: 开空仓（或平多后开空）
-   - HOLD: 观望
-6. **state::log_trade()** / **state::log_decision()** → 记录到日志
+### Phase 2: Portfolio Fund Allocation
 
-## LLM 决策逻辑
+1. **Portfolio Coordinator Allocation**: Allocate funds based on symbol analysis results
+2. **Strategy Development**: Choose portfolio strategy based on configuration
+   - `balanced`: Balanced allocation, moderate risk
+   - `aggressive`: Concentrate on best symbols, pursue high returns
+   - `conservative`: Diversified investment, control risk
 
-### System Prompt（交易分析师角色）
+### Phase 3: Sequential Trade Execution
 
-```
-核心哲学:
-1. 市场从不撒谎 - 价格包含一切信息
-2. 先活下来，再谈盈利 - 风险控制第一
-3. 系统胜于直觉 - 策略可复现
-4. 数据为骨，情绪为血 - 技术+心理
+Execute sequentially for each symbol:
+1. **Strategy Researcher Suggestion**: Develop specific strategies based on market conditions
+2. **Risk Manager Assessment**: Approve strategies, calculate suggested quantities
+3. **Trade Executor Execution**: Make comprehensive decisions, execute trades
 
-分析框架:
-- 市场结构: 识别趋势阶段
-- 技术验证: SMA交叉、动量、成交量
-- 风险评估: 持仓风险、回撤、止损
-- 操作纪律: 入场/出场逻辑
-```
+## Technical Indicators
 
-### User Prompt（数据驱动）
+System calculates the following technical indicators:
 
-系统会自动构建包含以下信息的提示词：
+- **Moving Averages**: SMA5, SMA20, SMA50, SMA100
+- **Price Change Rate**: 1-period, 3-period, 6-period, 12-period
+- **ATR Indicator**: 14-period Average True Range
+- **Volume Ratio**: Current volume / Average volume
 
-- **K线形态**：阳线/阴线、实体占比、收盘价
-- **均线状态**：多头/空头排列、价格相对 MA5/MA20 的偏离
-- **动量判断**：上涨加速/下跌加速/震荡整理
-- **成交量**：放量/缩量/正常
-- **持仓风险**：空仓/盈利中/亏损较大
+## Risk Control
 
-### 输出格式
+### Multi-layer Risk Protection
 
-```json
-{
-  "signal": "BUY",
-  "reason": "多头排列+放量突破+短期加速",
-  "confidence": "HIGH"
-}
-```
+1. **Agent Collaboration**: Each decision reviewed by multiple professional roles
+2. **Fund Allocation**: Portfolio coordinator allocates funds reasonably
+3. **Trading Constraints**: Adhere to exchange minimum order quantity, minimum notional value rules
+4. **Position Limits**: Maximum position control per symbol
+5. **Error Handling**: Single failure doesn't affect overall operation
 
-## 风险提示
+### Portfolio Strategies
 
-⚠️ **重要警告**：
+- **Balanced Mode**: Equally allocate based on analysis quality
+- **Aggressive Mode**: Concentrate funds on most promising symbols
+- **Conservative Mode**: Strictly control single symbol risk exposure
 
-1. **仅供学习研究**：本项目用于技术验证，不构成投资建议
-2. **测试网优先**：强烈建议先在 Binance 测试网运行数周
-3. **资金管理**：即使测试网，也应设置合理的 `TRADE_AMOUNT`
-4. **监控运行**：定期检查日志，观察决策质量
-5. **LLM 局限性**：大语言模型不是水晶球，无法预测未来
+## Risk Warning
 
-## 常见问题
+⚠️ **Important Warnings**:
 
-### 如何获取 Binance 测试网 API？
+1. **For Learning and Research Only**: This project is for technical validation, not investment advice
+2. **Testnet First**: Strongly recommend running on Binance testnet for several weeks first
+3. **Fund Management**: Even on testnet, set reasonable trading parameters
+4. **Monitor Operation**: Regularly check logs, observe decision quality
+5. **LLM Limitations**: Large language models are not crystal balls, cannot predict the future
 
-**重要更新**：Binance 测试网已迁移到 Demo 平台
+## FAQ
 
-1. 访问 https://demo.binance.com
-2. 使用 GitHub 或 Google 账号登录（或注册新账号）
-3. 进入 Futures 交易页面
-4. 点击右上角头像 → API Management
-5. 创建新的 API Key（自动获得测试资金）
-6. 复制 API Key 和 Secret 到 `.env` 文件
+### How to Get Binance Testnet API?
 
-**注意**：
-- 测试网 REST API 地址：`https://testnet.binancefuture.com`
-- Demo 平台会自动提供虚拟 USDT 用于测试
-- 测试网数据与主网实时同步，但交易不影响真实资金
+**Important Update**: Binance testnet has migrated to Demo platform
 
-### 如何获取 DeepSeek API？
+1. Visit https://demo.binance.com
+2. Login with GitHub or Google account (or register new account)
+3. Go to Futures trading page
+4. Click top-right avatar → API Management
+5. Create new API Key (automatically get test funds)
+6. Copy API Key and Secret to `.env` file
 
-1. 访问 https://platform.deepseek.com
-2. 注册账号并充值（首次赠送免费额度）
-3. 在 API Keys 页面创建密钥
+**Note**:
+- Testnet REST API address: `https://testnet.binancefuture.com`
+- Demo platform automatically provides virtual USDT for testing
+- Testnet data syncs with mainnet in real-time, but trades don't affect real funds
 
-### 程序报错：`缺少 BINANCE_API_KEY`
+### How to Get DeepSeek API?
 
-检查 `.env` 文件是否存在且正确配置。
+1. Visit https://platform.deepseek.com
+2. Register account and top up (first time gets free credits)
+3. Create API key in API Keys page
 
-### 程序报错：`获取K线数据失败`
+### Program Error: `Missing BINANCE_API_KEY`
 
-1. 检查网络连接
-2. 确认 Binance 测试网是否可访问
-3. 查看是否被限流（稍后重试）
+Check if `.env` file exists and is correctly configured.
 
-### 如何修改交易周期？
+### Program Error: `Failed to fetch K-line data`
 
-编辑 `.env` 文件中的 `TRADE_INTERVAL`：
-- `15m` - 15分钟
-- `30m` - 30分钟
-- `1h` - 1小时
+1. Check network connection
+2. Confirm Binance testnet is accessible
+3. Check if rate limited (retry later)
 
-### 如何添加更多交易对？
+### How to Modify Trading Interval?
 
-当前版本仅支持单一交易对。如需同时交易多个币种，需要：
-1. 修改 `Config` 结构支持多 symbol
-2. 在主循环中为每个 symbol 分别执行 `run_trading_cycle()`
+Edit `TRADE_INTERVAL` in `.env` file:
+- `1m` - 1 minute
+- `15m` - 15 minutes
+- `30m` - 30 minutes
+- `1h` - 1 hour
 
-## 代码统计
+### How to Add More Trading Pairs?
 
-```
-总计: 866 行
-├── executor.rs  267行 (交易执行+HMAC签名)
-├── llm.rs      179行 (DeepSeek API+提示词)
-├── main.rs     166行 (主程序+配置+循环)
-├── market.rs   118行 (Binance API+指标计算)
-├── types.rs     81行 (数据结构定义)
-└── state.rs     55行 (日志记录)
+Edit `TRADE_SYMBOLS` in `.env` file, separate multiple pairs with commas:
+```bash
+TRADE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,ADAUSDT
 ```
 
-## 技术栈
+## Code Statistics
+
+```
+Total: 1000+ lines
+├── main.rs          300+ lines (Main program + Portfolio coordination)
+├── executor.rs      267 lines (Trade execution + HMAC signing)
+├── multi_agent.rs   200+ lines (Multi-agent collaboration logic)
+├── llm.rs          179 lines (DeepSeek API + Prompts)
+├── market.rs       118 lines (Binance API + Indicator calculation)
+├── types.rs         81 lines (Data structure definitions)
+├── state.rs         55 lines (Logging)
+├── logging.rs       40 lines (Logging system)
+└── performance.rs   30 lines (Performance tracking)
+```
+
+## Tech Stack
 
 - **Rust** 1.83+ (edition 2021)
-- **async-openai** - DeepSeek API 客户端
-- **reqwest** - HTTP 请求
-- **tokio** - 异步运行时
-- **serde/serde_json** - JSON 序列化
-- **hmac/sha2** - Binance API 签名
-- **anyhow** - 错误处理
-- **chrono** - 时间处理
+- **async-openai** - DeepSeek API client
+- **reqwest** - HTTP requests
+- **tokio** - Async runtime
+- **serde/serde_json** - JSON serialization
+- **hmac/sha2** - Binance API signing
+- **anyhow** - Error handling
+- **chrono** - Time handling
+- **futures** - Async programming
+- **log/flexi_logger** - Logging system
 
 ## License
 

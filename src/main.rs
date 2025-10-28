@@ -60,26 +60,6 @@ impl SymbolCacheEntry {
     }
 }
 
-#[derive(Clone, Debug)]
-struct AccountCache {
-    info: executor::AccountInfo,
-    last_updated: DateTime<Utc>,
-}
-
-impl AccountCache {
-    fn new(info: executor::AccountInfo) -> Self {
-        AccountCache {
-            info,
-            last_updated: Utc::now(),
-        }
-    }
-
-    fn update(&mut self, info: executor::AccountInfo) {
-        self.info = info;
-        self.last_updated = Utc::now();
-    }
-}
-
 fn adjust_trade_quantity(
     desired: f64,
     allocated_max: f64,
@@ -499,7 +479,6 @@ async fn run_portfolio_cycle(
     interval_str: &str,
     constraints_map: &std::collections::HashMap<String, executor::SymbolConstraints>,
     symbols_cache: &mut std::collections::HashMap<String, SymbolCacheEntry>,
-    account_cache: &mut Option<AccountCache>,
     performance_tracker: &mut PerformanceTracker,
 ) -> Result<bool> {
     info!("============================================================");
@@ -545,11 +524,6 @@ async fn run_portfolio_cycle(
         executor::get_account_info(&config.binance_api_key, &config.binance_secret).await?;
     let total_balance: f64 = current_account.availableBalance.parse().unwrap_or(0.0);
     info!("总可用资金: {} USDT", total_balance);
-
-    match account_cache {
-        Some(cache) => cache.update(current_account.clone()),
-        None => *account_cache = Some(AccountCache::new(current_account.clone())),
-    }
 
     let mut portfolio_allocation = multi_agent::portfolio_coordinator_allocate(
         &symbols_reports,
@@ -681,10 +655,6 @@ async fn run_portfolio_cycle(
 
                 if let Some(snapshot) = account_snapshot {
                     current_account = snapshot;
-                    match account_cache {
-                        Some(cache) => cache.update(current_account.clone()),
-                        None => *account_cache = Some(AccountCache::new(current_account.clone())),
-                    }
                 }
 
                 if let Some(trade) = trade_result.as_ref() {
@@ -718,11 +688,6 @@ async fn run_portfolio_cycle(
             .entry(symbol)
             .or_insert_with(SymbolCacheEntry::empty)
             .update(analysis.position.clone());
-    }
-
-    match account_cache {
-        Some(cache) => cache.update(current_account.clone()),
-        None => *account_cache = Some(AccountCache::new(current_account.clone())),
     }
 
     Ok(any_traded)
@@ -851,7 +816,6 @@ async fn main() -> Result<()> {
     // 初始化缓存状态
     let mut symbols_cache: std::collections::HashMap<String, SymbolCacheEntry> =
         std::collections::HashMap::new();
-    let mut account_cache: Option<AccountCache> = None;
     let mut performance_tracker = PerformanceTracker::new();
 
     // 主循环
@@ -865,7 +829,6 @@ async fn main() -> Result<()> {
             interval_str,
             &symbol_constraints,
             &mut symbols_cache,
-            &mut account_cache,
             &mut performance_tracker,
         )
         .await
@@ -877,7 +840,6 @@ async fn main() -> Result<()> {
                 error!("投资组合交易周期失败: {:#}", e);
                 // 错误时清空所有缓存
                 symbols_cache.clear();
-                account_cache = None;
             }
         }
     }

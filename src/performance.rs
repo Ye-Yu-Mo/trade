@@ -3,7 +3,7 @@ use crate::types::{TradeAction, TradeResult};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::fs::{create_dir_all, write};
+use std::fs::{self, create_dir_all, write};
 use std::path::Path;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -27,6 +27,18 @@ pub struct PerformanceTracker {
 impl PerformanceTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 从 logs/performance.json 恢复历史绩效；文件不存在或损坏时从头开始。
+    pub fn load() -> Self {
+        let path = Path::new(logging::logs_directory()).join("performance.json");
+        match fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<PerformanceSnapshot>(&text).ok())
+        {
+            Some(snapshot) => Self { snapshot },
+            None => Self::new(),
+        }
     }
 
     pub fn snapshot(&self) -> &PerformanceSnapshot {

@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# 单智能体加密货币自动交易系统 - 启动脚本
+# 多智能体加密货币自动交易系统 - 启动脚本
 
 set -e
 
 echo "============================================================"
-echo "  单智能体加密货币自动交易系统"
+echo "  多智能体加密货币自动交易系统"
 echo "============================================================"
 echo ""
 
@@ -17,14 +17,14 @@ if [ ! -f .env ]; then
     exit 1
 fi
 
-# 检查 API 密钥是否配置
-if grep -q "YOUR_TESTNET_API_KEY_HERE" .env; then
-    echo "⚠️  警告: 检测到未配置的 API 密钥"
+# 检查 API 密钥是否仍是占位符
+if grep -qE "your_testnet_api_key|your_testnet_secret|your_deepseek_key" .env; then
+    echo "⚠️  警告: 检测到未配置的 API 密钥占位符"
     echo ""
     echo "请编辑 .env 文件，替换以下占位符："
-    echo "  - BINANCE_API_KEY=YOUR_TESTNET_API_KEY_HERE"
-    echo "  - BINANCE_SECRET=YOUR_TESTNET_SECRET_HERE"
-    echo "  - DEEPSEEK_API_KEY=YOUR_DEEPSEEK_API_KEY_HERE"
+    echo "  - BINANCE_API_KEY=your_testnet_api_key"
+    echo "  - BINANCE_SECRET=your_testnet_secret"
+    echo "  - DEEPSEEK_API_KEY=your_deepseek_key"
     echo ""
     read -p "是否继续运行？(可能会失败) [y/N]: " confirm
     if [[ ! $confirm =~ ^[Yy]$ ]]; then

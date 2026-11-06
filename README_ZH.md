@@ -1,6 +1,12 @@
 # 多智能体加密货币自动交易系统
 
+[![CI](https://github.com/Ye-Yu-Mo/trade/actions/workflows/ci.yml/badge.svg)](https://github.com/Ye-Yu-Mo/trade/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](rust-toolchain.toml)
+
 基于 DeepSeek 的多智能体协作投资组合交易机器人，使用 Rust 实现，在 Binance 测试网上对多个加密货币进行自动交易。
+
+> 这是一个研究与教学框架，**不是**能稳定盈利的交易系统。请先读[已知限制](#已知限制)。
 
 [English Version](README.md) | [中文版本](README_ZH.md)
 
@@ -12,6 +18,7 @@
 - **合约交易**：支持做多/做空，自动处理多空切换
 - **技术指标**：SMA(5/20/50/100)、价格变化率、ATR、成交量比
 - **风险控制**：持仓监控、盈亏跟踪、资金分配、错误重试
+- **历史回测**：确定性 SMA 基线与 LLM 基线，内置手续费和滑点，基线策略无需任何 API key
 
 ## 系统架构
 
@@ -155,6 +162,60 @@ cat logs/decisions.jsonl | jq -c '{symbol: .symbol, signal: .decision.signal, re
 cat logs/performance.json | jq
 ```
 
+## 历史回测
+
+回测**不需要 Binance API key**，内置的确定性 SMA 基线可以直接跑。
+
+```bash
+cargo run --release -- backtest \
+  --symbol BTCUSDT \
+  --interval 1h \
+  --start 2025-01-01 \
+  --end 2025-06-01 \
+  --strategy sma
+```
+
+```text
+================ 回测结果 ================
+标的: BTCUSDT | 周期: 1h | 策略: sma_cross
+区间: 2025-01-01 00:00 → 2025-03-01 00:00（1298 根K线）
+成本: 手续费 0.050% / 单边 | 滑点 2.0 bps
+-----------------------------------------
+初始资金:      10000.00 USDT
+最终权益:      9679.37 USDT
+策略收益:      -3.21%  |  买入持有: -14.77%
+最大回撤:      7.32%
+Sharpe:        -2.03
+交易次数:      63  |  胜率: 28.6%  |  暴露时间: 99.8%
+盈亏比:        0.70
+累计手续费:    124.10 USDT
+=========================================
+```
+
+设计要点：
+
+- 信号在K线收盘时产生，在**下一根K线开盘**成交，避免未来函数
+- 手续费（默认单边 5 bps，Binance U 本位 taker）和滑点（默认 2 bps）始终计入
+- 低信心信号直接忽略，避免均线粘合时反复反手喂手续费
+- 每次回测都会同时给出策略收益和买入持有收益，便于对照
+- K线缓存在 `data/klines/`，结果写入 `backtest/`（JSON + 权益曲线/成交明细 CSV）
+
+常用参数：
+
+| 参数 | 默认值 | 含义 |
+|---|---|---|
+| `--strategy` | `sma` | `sma`（确定性基线）或 `llm`（DeepSeek） |
+| `--position-pct` | `0.2` | 每次开仓占当前权益的比例 |
+| `--leverage` | `1.0` | 默认 1 倍，避免回测制造虚假收益 |
+| `--fee-bps` | `5` | 单边手续费（bps） |
+| `--slippage-bps` | `2` | 单边滑点（bps） |
+| `--max-bars` | 全部 | 限制决策次数（`--strategy llm` 建议配合使用） |
+
+LLM 基线每根K线调用一次模型，响应缓存在 `.cache/llm/`，同一区间重复回测不再产生费用。
+建议先用 `--max-bars` 控制规模。
+
+完整参数见 `cargo run -- backtest --help`。
+
 ## 多智能体决策流程
 
 ### 第一阶段：并行行情分析
@@ -203,6 +264,16 @@ cat logs/performance.json | jq
 - **均衡模式**：各标的按分析质量均衡分配
 - **激进模式**：集中资金到最有潜力的标的
 - **保守模式**：严格控制单标的风险敞口
+
+## 已知限制
+
+以下问题比功能列表更值得先看：
+
+1. **实盘执行层无法平仓到空仓。** `TradingDecision` 只有 BUY / SELL / HOLD。持多仓时 SELL 会先平多、再立刻开空；策略层的 `close_position` 意图被丢弃。回测引擎按相同语义建模，保证与实盘一致。
+2. **止损止盈只是建议。** 策略会输出 `stop_loss_pct` / `take_profit_pct`，但没有代码执行它们，也没有挂交易所条件单。
+3. **回测是简化模型。** 不模拟资金费率、保证金强平、盘口冲击和部分成交；成交按下一根K线开盘价加固定滑点计算。
+4. **LLM 决策不确定。** 同一根K线可能给出不同信号。缓存只避免重复付费，不能消除方差，请多跑几次再判断策略。
+5. **不宣称有超额收益。** 同时提供朴素的 SMA 基线和 LLM 基线，就是为了让结果可以被诚实地对照。
 
 ## 风险提示
 
@@ -263,19 +334,23 @@ cat logs/performance.json | jq
 TRADE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,ADAUSDT
 ```
 
-## 代码统计
+## 项目结构
 
 ```
-总计: 1000+ 行
-├── main.rs          300+行 (主程序+投资组合协调)
-├── executor.rs      267行 (交易执行+HMAC签名)
-├── multi_agent.rs   200+行 (多智能体协作逻辑)
-├── llm.rs          179行 (DeepSeek API+提示词)
-├── market.rs       118行 (Binance API+指标计算)
-├── types.rs         81行 (数据结构定义)
-├── state.rs         55行 (日志记录)
-├── logging.rs       40行 (日志系统)
-└── performance.rs   30行 (性能跟踪)
+src/
+├── main.rs          实盘 / 测试网交易循环与投资组合协调
+├── cli.rs           命令行入口（clap）
+├── backtest.rs      纸面账户、回测引擎、绩效指标
+├── strategy.rs      可插拔策略：SMA 交叉、LLM 基线
+├── data.rs          历史K线下载与本地缓存
+├── llm_client.rs    DeepSeek 客户端、响应缓存、JSON 解析
+├── multi_agent.rs   分析员 / 策略 / 风控 / 交易员 / 组合协调员
+├── executor.rs      Binance U 本位 REST + 账户 WebSocket
+├── market.rs        K线获取与技术指标
+├── types.rs         核心数据结构
+├── state.rs         交易与决策日志
+├── performance.rs   已实现盈亏与回撤跟踪
+└── logging.rs       日志系统
 ```
 
 ## 技术栈
@@ -293,4 +368,4 @@ TRADE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,ADAUSDT
 
 ## License
 
-MIT
+MIT，详见 [LICENSE](LICENSE)。

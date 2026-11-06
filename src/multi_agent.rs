@@ -1,16 +1,9 @@
 // 多智能体交易决策系统
 
 use crate::executor::{AccountInfo, SymbolConstraints};
+use crate::llm_client;
 use crate::types::*;
 use anyhow::{Context, Result};
-use async_openai::{
-    config::OpenAIConfig,
-    types::{
-        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
-    },
-    Client,
-};
 use serde_json::json;
 
 // ========== 1. 行情分析员 (Market Analyst) ==========
@@ -124,6 +117,7 @@ fn structured_prompt(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_risk_manager_prompt(
     symbol: &str,
     market_report: &MarketReport,
@@ -309,8 +303,8 @@ pub async fn market_analyst_analyze(
     api_key: &str,
 ) -> Result<MarketReport> {
     let prompt = build_market_analyst_prompt(symbol, interval, klines, indicators)?;
-    let response = call_deepseek(get_market_analyst_system_prompt(), &prompt, api_key).await?;
-    parse_json_response(&response)
+    let response = llm_client::chat(get_market_analyst_system_prompt(), &prompt, api_key).await?;
+    llm_client::parse_json(&response)
 }
 
 // ========== 2. 策略研究员 (Strategy Researcher) ==========
@@ -451,8 +445,9 @@ pub async fn strategy_researcher_suggest(
     api_key: &str,
 ) -> Result<StrategyAdvice> {
     let prompt = build_strategy_researcher_prompt(symbol, market_report, position)?;
-    let response = call_deepseek(get_strategy_researcher_system_prompt(), &prompt, api_key).await?;
-    parse_json_response(&response)
+    let response =
+        llm_client::chat(get_strategy_researcher_system_prompt(), &prompt, api_key).await?;
+    llm_client::parse_json(&response)
 }
 
 // ========== 3. 风险管理员 (Risk Manager) ==========
@@ -556,6 +551,7 @@ fn get_risk_manager_system_prompt() -> &'static str {
 **禁止输出任何JSON之外的内容。**"#
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn risk_manager_assess(
     symbol: &str,
     market_report: &MarketReport,
@@ -579,8 +575,8 @@ pub async fn risk_manager_assess(
         allocated_max_amount,
         max_position,
     )?;
-    let response = call_deepseek(get_risk_manager_system_prompt(), &prompt, api_key).await?;
-    parse_json_response(&response)
+    let response = llm_client::chat(get_risk_manager_system_prompt(), &prompt, api_key).await?;
+    llm_client::parse_json(&response)
 }
 
 // ========== 4. 决策交易员 (Trade Executor) ==========
@@ -722,8 +718,8 @@ pub async fn trade_executor_decide(
     api_key: &str,
 ) -> Result<TradingDecision> {
     let prompt = build_trade_executor_prompt(symbol, market_report, strategy, risk)?;
-    let response = call_deepseek(get_trade_executor_system_prompt(), &prompt, api_key).await?;
-    parse_json_response(&response)
+    let response = llm_client::chat(get_trade_executor_system_prompt(), &prompt, api_key).await?;
+    llm_client::parse_json(&response)
 }
 // ========== 5. 投资组合协调员 (Portfolio Coordinator) ==========
 
@@ -873,55 +869,6 @@ pub async fn portfolio_coordinator_allocate(
     let prompt =
         build_portfolio_coordinator_prompt(total_balance, portfolio_strategy, symbols_reports)?;
     let response =
-        call_deepseek(get_portfolio_coordinator_system_prompt(), &prompt, api_key).await?;
-    parse_json_response(&response)
-}
-
-// ========== 通用工具函数 ==========
-
-async fn call_deepseek(system_prompt: &str, user_prompt: &str, api_key: &str) -> Result<String> {
-    let config = OpenAIConfig::new()
-        .with_api_key(api_key)
-        .with_api_base("https://api.deepseek.com");
-
-    let client = Client::with_config(config);
-
-    let request = CreateChatCompletionRequestArgs::default()
-        .model("deepseek-chat")
-        .messages(vec![
-            ChatCompletionRequestMessage::System(
-                ChatCompletionRequestSystemMessageArgs::default()
-                    .content(system_prompt)
-                    .build()?,
-            ),
-            ChatCompletionRequestMessage::User(
-                ChatCompletionRequestUserMessageArgs::default()
-                    .content(user_prompt)
-                    .build()?,
-            ),
-        ])
-        .build()?;
-
-    let response = client
-        .chat()
-        .create(request)
-        .await
-        .context("DeepSeek API 调用失败")?;
-
-    let content = response
-        .choices
-        .first()
-        .and_then(|c| c.message.content.as_ref())
-        .context("DeepSeek 返回为空")?;
-
-    Ok(content.clone())
-}
-
-fn parse_json_response<T: serde::de::DeserializeOwned>(response: &str) -> Result<T> {
-    // 提取JSON（处理markdown代码块）
-    let json_start = response.find('{').context("未找到JSON起始")?;
-    let json_end = response.rfind('}').context("未找到JSON结束")? + 1;
-    let json_str = &response[json_start..json_end];
-
-    serde_json::from_str(json_str).context("解析JSON失败")
+        llm_client::chat(get_portfolio_coordinator_system_prompt(), &prompt, api_key).await?;
+    llm_client::parse_json(&response)
 }

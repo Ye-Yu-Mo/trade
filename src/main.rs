@@ -1,16 +1,21 @@
 // 多智能体加密货币自动交易系统
 
+mod backtest;
+mod cli;
+mod data;
 mod executor;
-mod llm;
+mod llm_client;
 mod logging;
 mod market;
 mod multi_agent;
 mod performance;
 mod state;
+mod strategy;
 mod types;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use clap::Parser;
 use dotenvy::dotenv;
 use futures::future::try_join_all;
 use log::{error, info, warn};
@@ -122,10 +127,11 @@ fn adjust_trade_quantity(
         return None;
     }
 
-    if constraints.min_notional > 0.0 && price > 0.0 {
-        if qty * price + f64::EPSILON < constraints.min_notional {
-            return None;
-        }
+    if constraints.min_notional > 0.0
+        && price > 0.0
+        && qty * price + f64::EPSILON < constraints.min_notional
+    {
+        return None;
     }
 
     if qty <= 0.0 {
@@ -327,7 +333,7 @@ async fn execute_symbol_cycle(
         &analysis.symbol,
         &analysis.market_report,
         &strategy,
-        &account,
+        account,
         &analysis.position,
         constraints,
         allocated_balance,
@@ -696,11 +702,19 @@ async fn run_portfolio_cycle(
 // Task 7.2 & 7.3: 主函数
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 加载环境变量
     dotenv().ok();
 
     logging::init_logging().context("初始化日志系统失败")?;
 
+    let cli = cli::Cli::parse();
+
+    match cli.command.unwrap_or(cli::Command::Run) {
+        cli::Command::Run => run_live().await,
+        cli::Command::Backtest(args) => cli::run_backtest(*args).await,
+    }
+}
+
+async fn run_live() -> Result<()> {
     // 加载配置
     let config = Config::from_env().context("配置加载失败")?;
 
@@ -728,7 +742,8 @@ async fn main() -> Result<()> {
         config.trade_interval_secs,
         config.trade_interval_secs / 60
     );
-    info!("API密钥前缀: {}***", &config.binance_api_key[..8]);
+    let key_prefix: String = config.binance_api_key.chars().take(8).collect();
+    info!("API密钥前缀: {}***", key_prefix);
     info!("启动中...");
 
     // 环境检查 - 测试Binance连接（使用第一个标的）
@@ -816,7 +831,15 @@ async fn main() -> Result<()> {
     // 初始化缓存状态
     let mut symbols_cache: std::collections::HashMap<String, SymbolCacheEntry> =
         std::collections::HashMap::new();
-    let mut performance_tracker = PerformanceTracker::new();
+    let mut performance_tracker = PerformanceTracker::load();
+
+    let snapshot = performance_tracker.snapshot();
+    if snapshot.total_trades > 0 {
+        info!(
+            "历史绩效: {} 笔交易, 已实现盈亏 {:.2} USDT, 最大回撤 {:.2}",
+            snapshot.total_trades, snapshot.total_realized_pnl, snapshot.max_drawdown
+        );
+    }
 
     // 主循环
     let mut ticker = interval(Duration::from_secs(config.trade_interval_secs));

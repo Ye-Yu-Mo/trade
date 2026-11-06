@@ -2,6 +2,7 @@ use crate::types::{Position, PositionSide, Signal, TradeAction, TradeResult, Tra
 use anyhow::{anyhow, Context, Result};
 use futures::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
+use log::{debug, warn};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::Sha256;
@@ -12,7 +13,6 @@ use tokio::sync::{watch, OnceCell};
 use tokio::time::{sleep, timeout, Duration, MissedTickBehavior};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use log::{debug, warn};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -66,7 +66,6 @@ impl AccountStreamHandle {
 struct BinanceOrderResponse {
     #[serde(rename = "orderId")]
     order_id: Option<i64>,
-    symbol: Option<String>,
     status: Option<String>,
 }
 
@@ -483,10 +482,7 @@ async fn create_listen_key(client: &reqwest::Client, api_key: &str) -> Result<St
         .context("申请 listenKey 失败")?;
 
     if !response.status().is_success() {
-        return Err(anyhow!(
-            "申请 listenKey 失败 [{}]",
-            response.status()
-        ));
+        return Err(anyhow!("申请 listenKey 失败 [{}]", response.status()));
     }
 
     let body: ListenKeyResponse = response.json().await.context("解析 listenKey 响应失败")?;
@@ -508,10 +504,7 @@ async fn keepalive_listen_key(
         .context("listenKey 保活请求失败")?;
 
     if !response.status().is_success() {
-        return Err(anyhow!(
-            "listenKey 保活失败 [{}]",
-            response.status()
-        ));
+        return Err(anyhow!("listenKey 保活失败 [{}]", response.status()));
     }
 
     Ok(())
@@ -708,6 +701,8 @@ async fn close_short(symbol: &str, amount: f64, api_key: &str, secret: &str) -> 
 }
 
 // Task 5.3: 执行交易决策
+// TODO(v0.4): 参数过多且缺少“平仓到空仓”的动作，统一重构为 OrderIntent。
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_decision(
     symbol: &str,
     decision: &TradingDecision,
@@ -721,18 +716,16 @@ pub async fn execute_decision(
     let timestamp = get_timestamp() as i64;
 
     match decision.signal {
-        Signal::Hold => {
-            return Ok(TradeResult {
-                symbol: symbol.to_string(),
-                action: TradeAction::Hold,
-                price: execution_price,
-                amount: 0.0,
-                timestamp,
-                reason: decision.reason.clone(),
-                pnl: None,
-                order_details: None,
-            });
-        }
+        Signal::Hold => Ok(TradeResult {
+            symbol: symbol.to_string(),
+            action: TradeAction::Hold,
+            price: execution_price,
+            amount: 0.0,
+            timestamp,
+            reason: decision.reason.clone(),
+            pnl: None,
+            order_details: None,
+        }),
         Signal::Buy => {
             match current_position {
                 None => {

@@ -6,3 +6,9 @@
 # 交易日志
 logs/
 *.log
+
+# 回测数据与输出
+data/
+backtest/
+.cache/
+

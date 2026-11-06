@@ -1,6 +1,6 @@
 # Multi-Agent Cryptocurrency Auto Trading System
 
-[![CI](https://github.com/Ye-Yu-Mo/trade/actions/workflows/ci.yml/badge.svg)](https://github.com/Ye-Yu-Mo/trade/actions/workflows/ci.yml)
+<!-- CI badge: re-enable after GitHub Actions billing is resolved. -->
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](rust-toolchain.toml)
 

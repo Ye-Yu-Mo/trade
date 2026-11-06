@@ -68,6 +68,11 @@
 
 配图：`docs/dashboard.png`（Dashboard）、`docs/social-preview.png`（头图）。
 
+草稿已放在：
+
+- 中文：`docs/blog/zh-verifiable-llm-trading.md`
+- English：`docs/blog/en-verifiable-llm-trading.md`
+
 ## 社区文案
 
 ### 中文短帖（V2EX / 即刻 / X）

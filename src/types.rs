@@ -42,6 +42,8 @@ pub struct TradingDecision {
 pub enum Signal {
     Buy,
     Sell,
+    /// 平仓到空仓。注意与 Sell 的区别：Sell 是反手开空，Close 是退出观望。
+    Close,
     Hold,
 }
 

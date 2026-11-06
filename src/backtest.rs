@@ -11,6 +11,7 @@
 
 use crate::data;
 use crate::market;
+use crate::risk;
 use crate::strategy::{BarContext, Strategy};
 use crate::types::{Confidence, Kline, Position, PositionSide, Signal, TradeAction};
 use anyhow::{bail, Context, Result};
@@ -33,6 +34,8 @@ pub struct BacktestConfig {
     pub leverage: f64,
     pub fee_rate: f64,
     pub slippage_bps: f64,
+    pub stop_loss_pct: f64,
+    pub take_profit_pct: f64,
     pub warmup: usize,
     pub data_dir: PathBuf,
     pub out_dir: PathBuf,
@@ -154,6 +157,10 @@ impl PaperBroker {
         reason: &str,
     ) -> Result<()> {
         let target = match signal {
+            Signal::Close => {
+                self.close(price, time, reason)?;
+                return Ok(());
+            }
             Signal::Buy => PositionSide::Long,
             Signal::Sell => PositionSide::Short,
             Signal::Hold => return Ok(()),
@@ -320,29 +327,57 @@ pub async fn run(cfg: BacktestConfig, mut strategy: Strategy) -> Result<Backtest
         let current_price = klines[i].close;
         let next = &klines[i + 1];
 
-        let position = broker.position_view(current_price);
-        let ctx = BarContext {
-            symbol: &cfg.symbol,
-            interval: &cfg.interval,
-            window,
-            indicators: &indicators,
-            position: position.as_ref(),
-            equity: broker.equity(current_price),
-            available_balance: broker.cash,
-        };
+        // 用本根K线的高低点判断盘中止损/止盈，避免只用收盘价低估风险
+        let mut risk_exit = false;
+        let open_position = broker
+            .position
+            .as_ref()
+            .map(|p| (p.side.clone(), p.entry_price));
+        if let Some((side, entry)) = open_position {
+            if let Some((fill_price, label)) = risk::intrabar_exit(
+                &side,
+                entry,
+                klines[i].open,
+                klines[i].high,
+                klines[i].low,
+                cfg.stop_loss_pct,
+                cfg.take_profit_pct,
+            ) {
+                let reason = format!("{}触发: 入场 {:.4}, 触发价 {:.4}", label, entry, fill_price);
+                broker.close(fill_price, klines[i].timestamp, &reason)?;
+                risk_exit = true;
+            }
+        }
 
-        let direction = strategy.decide(&ctx).await?;
+        // 风控出场当根不再重新入场，避免同一根K线里反复进出
+        if !risk_exit {
+            let position = broker.position_view(current_price);
+            let ctx = BarContext {
+                symbol: &cfg.symbol,
+                interval: &cfg.interval,
+                window,
+                indicators: &indicators,
+                position: position.as_ref(),
+                equity: broker.equity(current_price),
+                available_balance: broker.cash,
+            };
 
-        // 低信心信号不入场：均线粘合时反复反手只会喂手续费
-        if direction.signal != Signal::Hold && direction.confidence != Confidence::Low {
-            broker.execute(
-                direction.signal,
-                next.open,
-                next.timestamp,
-                cfg.position_pct,
-                cfg.leverage,
-                &direction.reason,
-            )?;
+            let direction = strategy.decide(&ctx).await?;
+
+            // 低信心入场信号跳过；平仓信号永远执行
+            let executable = matches!(direction.signal, Signal::Close)
+                || direction.confidence != Confidence::Low;
+
+            if direction.signal != Signal::Hold && executable {
+                broker.execute(
+                    direction.signal,
+                    next.open,
+                    next.timestamp,
+                    cfg.position_pct,
+                    cfg.leverage,
+                    &direction.reason,
+                )?;
+            }
         }
 
         let equity = broker.equity(next.close);
@@ -719,6 +754,19 @@ mod tests {
     }
 
     #[test]
+    fn close_signal_flattens_without_reopening() {
+        let mut b = broker();
+        b.execute(Signal::Buy, 100.0, 1, 0.5, 1.0, "long").unwrap();
+        b.execute(Signal::Close, 105.0, 2, 0.5, 1.0, "exit")
+            .unwrap();
+
+        assert!(b.position.is_none());
+        assert_eq!(b.fills.len(), 2);
+        assert!(matches!(b.fills[1].action, TradeAction::CloseLong));
+        assert!(b.fills[1].pnl.is_some_and(|p| p > 0.0));
+    }
+
+    #[test]
     fn same_direction_does_not_add() {
         let mut b = broker();
         b.execute(Signal::Buy, 100.0, 1, 0.5, 1.0, "first").unwrap();
@@ -809,6 +857,8 @@ mod tests {
             leverage: 1.0,
             fee_rate: 0.0005,
             slippage_bps: 0.0,
+            stop_loss_pct: 0.5,
+            take_profit_pct: 1.0,
             warmup: 120,
             data_dir: "data".into(),
             out_dir: "backtest".into(),

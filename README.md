@@ -18,6 +18,7 @@ A multi-agent collaborative portfolio trading bot built with Rust, using DeepSee
 - **Contract Trading**: Support for long/short positions, automatic position switching
 - **Technical Indicators**: SMA(5/20/50/100), Price Change Rate, ATR, Volume Ratio
 - **Risk Control**: Position monitoring, P&L tracking, fund allocation, error retry
+- **Deterministic Risk Layer**: stop-loss, take-profit, max drawdown and daily loss circuit breakers enforced in code, not by the LLM
 - **Backtesting**: deterministic SMA baseline and an LLM baseline, with fees and slippage. No API key required for the baseline.
 
 ## System Architecture
@@ -126,8 +127,6 @@ DEEPSEEK_API_KEY=your_deepseek_key
 
 # Trading Configuration
 TRADE_SYMBOLS=BTCUSDT,ETHUSDT  # Multiple symbols, comma separated
-MIN_TRADE_AMOUNT=0.001  # AI decision minimum trade quantity
-MAX_TRADE_AMOUNT=0.003  # AI decision maximum trade quantity
 TRADE_INTERVAL=1m  # Options: 1m, 15m, 30m, 1h
 LEVERAGE=10  # Leverage: 1-125
 MAX_POSITION=0.005  # Maximum position per symbol
@@ -182,13 +181,13 @@ cargo run --release -- backtest \
 成本: 手续费 0.050% / 单边 | 滑点 2.0 bps
 -----------------------------------------
 初始资金:      10000.00 USDT
-最终权益:      9679.37 USDT
-策略收益:      -3.21%  |  买入持有: -14.77%
-最大回撤:      7.32%
-Sharpe:        -2.03
-交易次数:      63  |  胜率: 28.6%  |  暴露时间: 99.8%
-盈亏比:        0.70
-累计手续费:    124.10 USDT
+最终权益:      9821.36 USDT
+策略收益:      -1.79%  |  买入持有: -14.77%
+最大回撤:      6.44%
+Sharpe:        -1.09
+交易次数:      89  |  胜率: 31.5%  |  暴露时间: 86.3%
+盈亏比:        0.87
+累计手续费:    177.29 USDT
 =========================================
 ```
 
@@ -196,7 +195,9 @@ How it works:
 
 - A signal is generated at bar close and filled at the **next bar's open**, so there is no look-ahead bias.
 - Fees (default 5 bps per side, Binance USDT-M taker) and slippage (default 2 bps) are always applied.
-- Low-confidence signals are ignored to avoid churning on flat moving averages.
+- Low-confidence **entry** signals are ignored; close signals always execute.
+- Stops are checked intrabar using the bar high/low, with gap fills at the bar open.
+- Closing is an explicit `CLOSE` action instead of a forced reversal.
 - Every run reports buy-and-hold return next to the strategy return.
 - K-lines are cached in `data/klines/`; results go to `backtest/` as JSON plus equity/trade CSVs.
 
@@ -209,6 +210,8 @@ Key options:
 | `--leverage` | `1.0` | Kept at 1x by default to avoid fake returns |
 | `--fee-bps` | `5` | Per-side fee in basis points |
 | `--slippage-bps` | `2` | Per-side slippage in basis points |
+| `--stop-loss-pct` | `0.02` | Intrabar stop-loss as a fraction of entry notional |
+| `--take-profit-pct` | `0.05` | Intrabar take-profit as a fraction of entry notional |
 | `--max-bars` | all | Limit the number of decisions (useful for `--strategy llm`) |
 
 The LLM baseline makes one model call per bar and caches responses in `.cache/llm/`, so repeated
@@ -265,21 +268,45 @@ System calculates the following technical indicators:
 - **Aggressive Mode**: Concentrate funds on most promising symbols
 - **Conservative Mode**: Strictly control single symbol risk exposure
 
+## Risk Controls and Close Semantics
+
+### CLOSE vs SELL
+
+| Current position | BUY | SELL | CLOSE |
+|---|---|---|---|
+| Flat | open long | open short | no-op |
+| Long | add | close long, open short | close to flat |
+| Short | close short, open long | add | close to flat |
+
+### Deterministic risk layer
+
+- **Stop-loss / take-profit**: default 2% / 5% of entry notional. When hit, the position is closed
+  by code without calling the LLM.
+- **Circuit breakers**: new positions are blocked when equity draws down 20% from its peak or loses
+  5% in a day. Existing positions are force-closed by default.
+- **Persisted state**: `logs/risk_state.json`. A daily-loss halt clears on the next UTC day; a
+  drawdown halt requires deleting the file and restarting.
+- **Configuration**: `RISK_ENABLED`, `RISK_STOP_LOSS_PCT`, `RISK_TAKE_PROFIT_PCT`,
+  `RISK_MAX_DRAWDOWN_PCT`, `RISK_DAILY_LOSS_PCT`, `RISK_CLOSE_ON_HALT`.
+
+Live risk checks run once per trading cycle; no exchange conditional orders are placed yet, so
+extreme moves can slip.
+
 ## Known Limitations
 
 These are real, and they matter more than the feature list:
 
-1. **The live executor cannot go flat.** `TradingDecision` only carries BUY / SELL / HOLD. While
-   holding a long, SELL closes the long *and immediately opens a short*. The strategy layer's
-   `close_position` intent is dropped. The backtester models the same behavior for parity.
-2. **Stop-loss / take-profit are advisory only.** The strategy agent emits `stop_loss_pct` and
-   `take_profit_pct`, but nothing enforces them and no exchange conditional orders are placed.
-3. **The backtest is simplified.** It ignores funding rates, margin liquidation, order-book impact
-   and partial fills. Fills happen at the next bar open with a fixed slippage.
-4. **LLM decisions are non-deterministic.** The same bar can produce different signals. The cache
+1. **The backtest is simplified.** It ignores funding rates, margin liquidation, order-book impact
+   and partial fills. Intrabar stops are inferred from bar high/low; the true order inside a bar is
+   unknowable. Entries fill at the next bar open with fixed slippage.
+2. **Live risk checks are per-cycle.** Stops and take-profits are evaluated once per cycle (1 minute
+   by default) with no exchange-side conditional orders.
+3. **LLM decisions are non-deterministic.** The same bar can produce different signals. The cache
    avoids repeated charges, not variance. Measure a strategy over many runs before believing it.
-5. **No edge is claimed.** A naive SMA baseline and an LLM baseline are both included precisely so
+4. **No edge is claimed.** A naive SMA baseline and an LLM baseline are both included precisely so
    results can be compared honestly.
+5. **Halts need a human.** A drawdown halt does not auto-reset; delete `logs/risk_state.json` after
+   verifying the account, then restart.
 
 ## Risk Warning
 

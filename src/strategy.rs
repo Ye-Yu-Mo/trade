@@ -92,7 +92,20 @@ impl SmaCrossStrategy {
             Confidence::Low
         };
 
-        if fast > slow {
+        // 均线粘合视为无趋势：有仓位就退出观望，而不是立刻反手
+        if gap_pct.abs() < 0.1 {
+            return if ctx.position.is_some() {
+                Direction {
+                    signal: Signal::Close,
+                    confidence: Confidence::Low,
+                    reason: format!("SMA5/SMA20 粘合（{:.2}%），平仓观望", gap_pct),
+                }
+            } else {
+                Direction::hold("均线粘合，无趋势")
+            };
+        }
+
+        if gap_pct > 0.0 {
             Direction {
                 signal: Signal::Buy,
                 confidence,
@@ -192,13 +205,14 @@ const SYSTEM_PROMPT: &str = r#"你是一名加密货币趋势交易员。
 
 规则：
 1. 只依据给定的价格、均线、动量和成交量数据判断方向，不要编造数据。
-2. BUY 表示持有多头，SELL 表示持有空头，HOLD 表示维持现状。
-3. 趋势不明确时选择 HOLD，不要为了交易而交易。
-4. reason 控制在 50 字以内。
+2. BUY 表示持有多头，SELL 表示持有空头，CLOSE 表示平仓到空仓，HOLD 表示维持现状。
+3. 想退出观望用 CLOSE；想反手用 SELL/BUY，不要在只想平仓时使用反向信号。
+4. 趋势不明确时选择 HOLD 或 CLOSE，不要为了交易而交易。
+5. reason 控制在 50 字以内。
 
 严格输出 JSON，不要输出任何其他内容：
 {
-  "signal": "BUY" | "SELL" | "HOLD",
+  "signal": "BUY" | "SELL" | "CLOSE" | "HOLD",
   "confidence": "HIGH" | "MEDIUM" | "LOW",
   "reason": "判断依据"
 }"#;
@@ -206,7 +220,7 @@ const SYSTEM_PROMPT: &str = r#"你是一名加密货币趋势交易员。
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::TechnicalIndicators;
+    use crate::types::{Position, PositionSide, TechnicalIndicators};
 
     fn indicators(sma_5: f64, sma_20: f64) -> TechnicalIndicators {
         TechnicalIndicators {
@@ -224,16 +238,24 @@ mod tests {
         }
     }
 
-    fn context<'a>(window: &'a [Kline], ind: &'a TechnicalIndicators) -> BarContext<'a> {
+    fn context_with<'a>(
+        window: &'a [Kline],
+        ind: &'a TechnicalIndicators,
+        position: Option<&'a Position>,
+    ) -> BarContext<'a> {
         BarContext {
             symbol: "BTCUSDT",
             interval: "1h",
             window,
             indicators: ind,
-            position: None,
+            position,
             equity: 10_000.0,
             available_balance: 10_000.0,
         }
+    }
+
+    fn context<'a>(window: &'a [Kline], ind: &'a TechnicalIndicators) -> BarContext<'a> {
+        context_with(window, ind, None)
     }
 
     #[test]
@@ -270,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn tiny_gap_is_low_confidence() {
+    fn tiny_gap_without_position_holds() {
         let ind = indicators(100.02, 100.0);
         let bars = vec![Kline {
             timestamp: 0,
@@ -281,9 +303,28 @@ mod tests {
             volume: 1.0,
         }];
         let ctx = context(&bars, &ind);
-        let dir = SmaCrossStrategy.decide(&ctx);
-        assert_eq!(dir.signal, Signal::Buy);
-        assert_eq!(dir.confidence, Confidence::Low);
+        assert_eq!(SmaCrossStrategy.decide(&ctx).signal, Signal::Hold);
+    }
+
+    #[test]
+    fn tiny_gap_with_position_closes_to_flat() {
+        let ind = indicators(100.02, 100.0);
+        let bars = vec![Kline {
+            timestamp: 0,
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.0,
+            volume: 1.0,
+        }];
+        let position = Position {
+            side: PositionSide::Long,
+            amount: 1.0,
+            entry_price: 100.0,
+            unrealized_pnl: 0.0,
+        };
+        let ctx = context_with(&bars, &ind, Some(&position));
+        assert_eq!(SmaCrossStrategy.decide(&ctx).signal, Signal::Close);
     }
 
     #[test]

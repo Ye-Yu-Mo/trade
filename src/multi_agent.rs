@@ -659,7 +659,15 @@ fn get_trade_executor_system_prompt() -> &'static str {
 
 * **BUY信号**：趋势bullish + 策略open_long/add_position + 风控approved/adjusted
 * **SELL信号**：趋势bearish + 策略open_short + 风控approved/adjusted
+* **CLOSE信号**：策略action=close_position，或target_side=null 且当前有持仓 → 平仓到空仓
 * **HOLD信号**：风控rejected / 信号矛盾 / 趋势不明
+
+**重要：平仓不等于反手。**
+
+* 想退出观望 → CLOSE
+* 想从多仓转到空仓 → SELL（会先平多再开空）
+* 想从空仓转到多仓 → BUY（会先平空再开多）
+* 不确定时 → HOLD，保持现状
 
 **第五层：数量与信心评估**
 
@@ -676,7 +684,7 @@ fn get_trade_executor_system_prompt() -> &'static str {
 严格返回JSON格式：
 
 {
-  "signal": "BUY"|"SELL"|"HOLD",
+  "signal": "BUY"|"SELL"|"CLOSE"|"HOLD",
   "amount": 0.001,
   "confidence": "HIGH"|"MEDIUM"|"LOW",
   "reason": "综合判断，50字内"
@@ -702,7 +710,7 @@ fn build_trade_executor_prompt(
         "根据三方的结构化汇总（JSON）做出最终交易决定。",
         &payload,
         r#"{
-  "signal": "BUY" | "SELL" | "HOLD",
+  "signal": "BUY" | "SELL" | "CLOSE" | "HOLD",
   "amount": 数字,
   "confidence": "HIGH" | "MEDIUM" | "LOW",
   "reason": "综合判断，<=50字"

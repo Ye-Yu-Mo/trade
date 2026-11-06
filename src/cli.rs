@@ -83,6 +83,14 @@ pub struct BacktestArgs {
     #[arg(long, default_value_t = 2.0)]
     pub slippage_bps: f64,
 
+    /// 止损：仓位浮亏达到开仓名义价值的该比例时平仓
+    #[arg(long, default_value_t = 0.02)]
+    pub stop_loss_pct: f64,
+
+    /// 止盈：仓位浮盈达到开仓名义价值的该比例时平仓
+    #[arg(long, default_value_t = 0.05)]
+    pub take_profit_pct: f64,
+
     /// 指标预热所需K线数量
     #[arg(long, default_value_t = 120)]
     pub warmup: usize,
@@ -155,6 +163,8 @@ pub async fn run_backtest(args: BacktestArgs) -> Result<()> {
         leverage: args.leverage,
         fee_rate: args.fee_bps / 10_000.0,
         slippage_bps: args.slippage_bps,
+        stop_loss_pct: args.stop_loss_pct,
+        take_profit_pct: args.take_profit_pct,
         warmup: args.warmup,
         data_dir: args.data_dir,
         out_dir: args.out_dir,

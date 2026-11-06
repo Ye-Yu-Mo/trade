@@ -67,6 +67,32 @@ struct BinanceOrderResponse {
     #[serde(rename = "orderId")]
     order_id: Option<i64>,
     status: Option<String>,
+    #[serde(rename = "avgPrice")]
+    avg_price: Option<String>,
+    #[serde(rename = "executedQty")]
+    executed_qty: Option<String>,
+}
+
+/// 市价单的实际成交信息。avg_price 为 None 表示交易所还没返回成交均价。
+#[derive(Debug, Clone)]
+pub struct OrderFill {
+    pub order_id: i64,
+    pub status: String,
+    pub avg_price: Option<f64>,
+    pub executed_qty: Option<f64>,
+}
+
+impl std::fmt::Display for OrderFill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "订单ID:{} 状态:{}", self.order_id, self.status)?;
+        if let Some(price) = self.avg_price {
+            write!(f, " 均价:{:.6}", price)?;
+        }
+        if let Some(qty) = self.executed_qty {
+            write!(f, " 成交:{:.6}", qty)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -627,81 +653,194 @@ pub async fn set_leverage(symbol: &str, leverage: u32, api_key: &str, secret: &s
 }
 
 // Task 5.2: 订单执行函数
+const MAX_ORDER_RETRIES: u32 = 3;
+const ORDER_RETRY_DELAY_MS: u64 = 500;
+
+/// clientOrderId 让重试变成幂等操作：网络抖动时不会重复下单。
+fn client_order_id(symbol: &str, tag: &str) -> String {
+    format!("t{}-{}-{}", get_timestamp(), symbol, tag)
+}
+
+fn parse_order_fill(text: &str) -> Option<OrderFill> {
+    let order: BinanceOrderResponse = serde_json::from_str(text).ok()?;
+    Some(OrderFill {
+        order_id: order.order_id.unwrap_or(0),
+        status: order.status.unwrap_or_else(|| "UNKNOWN".to_string()),
+        avg_price: order
+            .avg_price
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|p| *p > 0.0),
+        executed_qty: order
+            .executed_qty
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|q| *q > 0.0),
+    })
+}
+
 async fn place_order(
     symbol: &str,
     side: &str,          // BUY or SELL
     position_side: &str, // LONG or SHORT
     quantity: f64,
+    client_order_id: &str,
     api_key: &str,
     secret: &str,
-) -> Result<String> {
+) -> Result<OrderFill> {
     let base_url = get_binance_base_url();
-    let timestamp = get_timestamp();
-    let query_string = format!(
-        "symbol={}&side={}&positionSide={}&type=MARKET&quantity={}&timestamp={}",
-        symbol, side, position_side, quantity, timestamp
-    );
-    let signature = generate_signature(&query_string, secret);
-
-    let url = format!(
-        "{}/fapi/v1/order?{}&signature={}",
-        base_url, query_string, signature
-    );
-
     let client = reqwest::Client::new();
-    let response = client
-        .post(&url)
-        .header("X-MBX-APIKEY", api_key)
-        .send()
-        .await
-        .context("订单请求失败")?;
+    let mut last_error: Option<anyhow::Error> = None;
 
-    let status = response.status();
-    let response_text = response.text().await.context("读取响应失败")?;
+    for attempt in 1..=MAX_ORDER_RETRIES {
+        let timestamp = get_timestamp();
+        let query_string = format!(
+            "symbol={}&side={}&positionSide={}&type=MARKET&quantity={}&newClientOrderId={}&timestamp={}",
+            symbol, side, position_side, quantity, client_order_id, timestamp
+        );
+        let signature = generate_signature(&query_string, secret);
+        let url = format!(
+            "{}/fapi/v1/order?{}&signature={}",
+            base_url, query_string, signature
+        );
 
-    if !status.is_success() {
-        // 尝试解析错误信息
-        if let Ok(error) = serde_json::from_str::<BinanceError>(&response_text) {
-            return Err(anyhow::anyhow!(
-                "订单失败 [code:{}]: {}",
-                error.code.unwrap_or(-1),
-                error.msg.unwrap_or_else(|| "未知错误".to_string())
-            ));
-        } else {
-            return Err(anyhow::anyhow!("订单失败 [{}]: {}", status, response_text));
+        match client
+            .post(&url)
+            .header("X-MBX-APIKEY", api_key)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                let response_text = response.text().await.context("读取响应失败")?;
+
+                if !status.is_success() {
+                    let error =
+                        if let Ok(parsed) = serde_json::from_str::<BinanceError>(&response_text) {
+                            anyhow::anyhow!(
+                                "订单失败 [code:{}]: {}",
+                                parsed.code.unwrap_or(-1),
+                                parsed.msg.unwrap_or_else(|| "未知错误".to_string())
+                            )
+                        } else {
+                            anyhow::anyhow!("订单失败 [{}]: {}", status, response_text)
+                        };
+
+                    // 4xx 属于业务错误（余额不足、参数错误等），重试没有意义
+                    if status.is_client_error() {
+                        return Err(error);
+                    }
+                    last_error = Some(error);
+                } else {
+                    let mut fill = parse_order_fill(&response_text).context("解析订单响应失败")?;
+                    if fill.avg_price.is_none() && fill.order_id > 0 {
+                        match query_order(symbol, fill.order_id, api_key, secret).await {
+                            Ok(Some(queried)) => fill = queried,
+                            Ok(None) => {}
+                            Err(err) => warn!("查询成交价失败，使用下单前价格: {:#}", err),
+                        }
+                    }
+                    return Ok(fill);
+                }
+            }
+            Err(err) => {
+                last_error = Some(err.into());
+            }
+        }
+
+        if attempt < MAX_ORDER_RETRIES {
+            warn!(
+                "下单失败（第 {}/{} 次），{}ms 后使用同一 clientOrderId 重试",
+                attempt, MAX_ORDER_RETRIES, ORDER_RETRY_DELAY_MS
+            );
+            sleep(Duration::from_millis(ORDER_RETRY_DELAY_MS)).await;
         }
     }
 
-    // 解析成功响应
-    if let Ok(order) = serde_json::from_str::<BinanceOrderResponse>(&response_text) {
-        Ok(format!(
-            "订单ID:{}, 状态:{}",
-            order.order_id.unwrap_or(0),
-            order.status.unwrap_or_else(|| "UNKNOWN".to_string())
-        ))
-    } else {
-        Ok("订单已提交".to_string())
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("订单失败")))
+}
+
+async fn query_order(
+    symbol: &str,
+    order_id: i64,
+    api_key: &str,
+    secret: &str,
+) -> Result<Option<OrderFill>> {
+    let timestamp = get_timestamp();
+    let query_string = format!(
+        "symbol={}&orderId={}&timestamp={}",
+        symbol, order_id, timestamp
+    );
+    let signature = generate_signature(&query_string, secret);
+    let url = format!(
+        "{}/fapi/v1/order?{}&signature={}",
+        get_binance_base_url(),
+        query_string,
+        signature
+    );
+
+    let response = reqwest::Client::new()
+        .get(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .context("查询订单失败")?;
+
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+
+    let text = response.text().await.context("读取订单响应失败")?;
+    Ok(parse_order_fill(&text))
+}
+
+async fn open_long(symbol: &str, amount: f64, api_key: &str, secret: &str) -> Result<OrderFill> {
+    let id = client_order_id(symbol, "ol");
+    place_order(symbol, "BUY", "LONG", amount, &id, api_key, secret).await
+}
+
+async fn close_long(symbol: &str, amount: f64, api_key: &str, secret: &str) -> Result<OrderFill> {
+    let id = client_order_id(symbol, "cl");
+    place_order(symbol, "SELL", "LONG", amount, &id, api_key, secret).await
+}
+
+async fn open_short(symbol: &str, amount: f64, api_key: &str, secret: &str) -> Result<OrderFill> {
+    let id = client_order_id(symbol, "os");
+    place_order(symbol, "SELL", "SHORT", amount, &id, api_key, secret).await
+}
+
+async fn close_short(symbol: &str, amount: f64, api_key: &str, secret: &str) -> Result<OrderFill> {
+    let id = client_order_id(symbol, "cs");
+    place_order(symbol, "BUY", "SHORT", amount, &id, api_key, secret).await
+}
+
+fn filled_price(fill: &OrderFill, fallback: f64) -> f64 {
+    fill.avg_price.unwrap_or(fallback)
+}
+
+fn filled_qty(fill: &OrderFill, fallback: f64) -> f64 {
+    fill.executed_qty.unwrap_or(fallback)
+}
+
+fn close_pnl(side: &PositionSide, entry: f64, exit: f64, qty: f64) -> f64 {
+    match side {
+        PositionSide::Long => (exit - entry) * qty,
+        PositionSide::Short => (entry - exit) * qty,
     }
 }
 
-async fn open_long(symbol: &str, amount: f64, api_key: &str, secret: &str) -> Result<String> {
-    place_order(symbol, "BUY", "LONG", amount, api_key, secret).await
-}
-
-async fn close_long(symbol: &str, amount: f64, api_key: &str, secret: &str) -> Result<String> {
-    place_order(symbol, "SELL", "LONG", amount, api_key, secret).await
-}
-
-async fn open_short(symbol: &str, amount: f64, api_key: &str, secret: &str) -> Result<String> {
-    place_order(symbol, "SELL", "SHORT", amount, api_key, secret).await
-}
-
-async fn close_short(symbol: &str, amount: f64, api_key: &str, secret: &str) -> Result<String> {
-    place_order(symbol, "BUY", "SHORT", amount, api_key, secret).await
+fn hold_result(symbol: &str, price: f64, timestamp: i64, reason: String) -> TradeResult {
+    TradeResult {
+        symbol: symbol.to_string(),
+        action: TradeAction::Hold,
+        price,
+        amount: 0.0,
+        timestamp,
+        reason,
+        pnl: None,
+        order_details: None,
+    }
 }
 
 // Task 5.3: 执行交易决策
-// TODO(v0.4): 参数过多且缺少“平仓到空仓”的动作，统一重构为 OrderIntent。
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_decision(
     symbol: &str,
@@ -716,153 +855,172 @@ pub async fn execute_decision(
     let timestamp = get_timestamp() as i64;
 
     match decision.signal {
-        Signal::Hold => Ok(TradeResult {
-            symbol: symbol.to_string(),
-            action: TradeAction::Hold,
-            price: execution_price,
-            amount: 0.0,
+        Signal::Hold => Ok(hold_result(
+            symbol,
+            execution_price,
             timestamp,
-            reason: decision.reason.clone(),
-            pnl: None,
-            order_details: None,
-        }),
-        Signal::Buy => {
-            match current_position {
-                None => {
-                    // 空仓 → 开多
-                    let order_info = open_long(symbol, trade_amount, api_key, secret).await?;
+            decision.reason.clone(),
+        )),
+        Signal::Close => match current_position {
+            None => Ok(hold_result(
+                symbol,
+                execution_price,
+                timestamp,
+                format!("{} (无持仓可平)", decision.reason),
+            )),
+            Some(pos) => {
+                let fill = match pos.side {
+                    PositionSide::Long => close_long(symbol, pos.amount, api_key, secret).await?,
+                    PositionSide::Short => close_short(symbol, pos.amount, api_key, secret).await?,
+                };
+                let price = filled_price(&fill, execution_price);
+                let pnl = close_pnl(&pos.side, pos.entry_price, price, pos.amount);
+                Ok(TradeResult {
+                    symbol: symbol.to_string(),
+                    action: match pos.side {
+                        PositionSide::Long => TradeAction::CloseLong,
+                        PositionSide::Short => TradeAction::CloseShort,
+                    },
+                    price,
+                    amount: pos.amount,
+                    timestamp,
+                    reason: format!("{} (平仓盈亏: {:.2})", decision.reason, pnl),
+                    pnl: Some(pnl),
+                    order_details: Some(fill.to_string()),
+                })
+            }
+        },
+        Signal::Buy => match current_position {
+            None => {
+                let fill = open_long(symbol, trade_amount, api_key, secret).await?;
+                Ok(TradeResult {
+                    symbol: symbol.to_string(),
+                    action: TradeAction::OpenLong,
+                    price: filled_price(&fill, execution_price),
+                    amount: filled_qty(&fill, trade_amount),
+                    timestamp,
+                    reason: decision.reason.clone(),
+                    pnl: None,
+                    order_details: Some(fill.to_string()),
+                })
+            }
+            Some(pos) if pos.side == PositionSide::Short => {
+                // 平空 → 开多
+                let close = close_short(symbol, pos.amount, api_key, secret).await?;
+                let close_price = filled_price(&close, execution_price);
+                let pnl = close_pnl(
+                    &PositionSide::Short,
+                    pos.entry_price,
+                    close_price,
+                    pos.amount,
+                );
+                let open = open_long(symbol, trade_amount, api_key, secret).await?;
+                Ok(TradeResult {
+                    symbol: symbol.to_string(),
+                    action: TradeAction::OpenLong,
+                    price: filled_price(&open, execution_price),
+                    amount: filled_qty(&open, trade_amount),
+                    timestamp,
+                    reason: format!("{} (平空仓盈亏: {:.2})", decision.reason, pnl),
+                    pnl: Some(pnl),
+                    order_details: Some(format!("平空:{}, 开多:{}", close, open)),
+                })
+            }
+            Some(pos) => {
+                let new_total = pos.amount + trade_amount;
+                if new_total > max_position {
+                    Ok(hold_result(
+                        symbol,
+                        execution_price,
+                        timestamp,
+                        format!(
+                            "已达最大持仓 {:.4}/{:.4}，无法加仓",
+                            pos.amount, max_position
+                        ),
+                    ))
+                } else {
+                    let fill = open_long(symbol, trade_amount, api_key, secret).await?;
                     Ok(TradeResult {
                         symbol: symbol.to_string(),
                         action: TradeAction::OpenLong,
-                        price: execution_price,
-                        amount: trade_amount,
+                        price: filled_price(&fill, execution_price),
+                        amount: filled_qty(&fill, trade_amount),
                         timestamp,
-                        reason: decision.reason.clone(),
+                        reason: format!(
+                            "{} (加仓: {:.4} → {:.4})",
+                            decision.reason, pos.amount, new_total
+                        ),
                         pnl: None,
-                        order_details: Some(order_info),
+                        order_details: Some(fill.to_string()),
                     })
-                }
-                Some(pos) if pos.side == PositionSide::Short => {
-                    // 持有空仓 → 平空 → 开多
-                    let close_info = close_short(symbol, pos.amount, api_key, secret).await?;
-                    let pnl = (pos.entry_price - execution_price) * pos.amount;
-                    let open_info = open_long(symbol, trade_amount, api_key, secret).await?;
-                    Ok(TradeResult {
-                        symbol: symbol.to_string(),
-                        action: TradeAction::OpenLong,
-                        price: execution_price,
-                        amount: trade_amount,
-                        timestamp,
-                        reason: format!("{} (平空仓盈亏: {:.2})", decision.reason, pnl),
-                        pnl: Some(pnl),
-                        order_details: Some(format!("平空:{}, 开多:{}", close_info, open_info)),
-                    })
-                }
-                Some(pos) => {
-                    // 已持有多仓 → 检查是否可以加仓
-                    let new_total = pos.amount + trade_amount;
-                    if new_total > max_position {
-                        Ok(TradeResult {
-                            symbol: symbol.to_string(),
-                            action: TradeAction::Hold,
-                            price: execution_price,
-                            amount: 0.0,
-                            timestamp,
-                            reason: format!(
-                                "已达最大持仓 {:.4}/{:.4}，无法加仓",
-                                pos.amount, max_position
-                            ),
-                            pnl: None,
-                            order_details: None,
-                        })
-                    } else {
-                        // 加仓
-                        let order_info = open_long(symbol, trade_amount, api_key, secret).await?;
-                        Ok(TradeResult {
-                            symbol: symbol.to_string(),
-                            action: TradeAction::OpenLong,
-                            price: execution_price,
-                            amount: trade_amount,
-                            timestamp,
-                            reason: format!(
-                                "{} (加仓: {:.4} → {:.4})",
-                                decision.reason, pos.amount, new_total
-                            ),
-                            pnl: None,
-                            order_details: Some(order_info),
-                        })
-                    }
                 }
             }
-        }
-        Signal::Sell => {
-            match current_position {
-                None => {
-                    // 空仓 → 开空
-                    let order_info = open_short(symbol, trade_amount, api_key, secret).await?;
+        },
+        Signal::Sell => match current_position {
+            None => {
+                let fill = open_short(symbol, trade_amount, api_key, secret).await?;
+                Ok(TradeResult {
+                    symbol: symbol.to_string(),
+                    action: TradeAction::OpenShort,
+                    price: filled_price(&fill, execution_price),
+                    amount: filled_qty(&fill, trade_amount),
+                    timestamp,
+                    reason: decision.reason.clone(),
+                    pnl: None,
+                    order_details: Some(fill.to_string()),
+                })
+            }
+            Some(pos) if pos.side == PositionSide::Long => {
+                // 平多 → 开空
+                let close = close_long(symbol, pos.amount, api_key, secret).await?;
+                let close_price = filled_price(&close, execution_price);
+                let pnl = close_pnl(
+                    &PositionSide::Long,
+                    pos.entry_price,
+                    close_price,
+                    pos.amount,
+                );
+                let open = open_short(symbol, trade_amount, api_key, secret).await?;
+                Ok(TradeResult {
+                    symbol: symbol.to_string(),
+                    action: TradeAction::OpenShort,
+                    price: filled_price(&open, execution_price),
+                    amount: filled_qty(&open, trade_amount),
+                    timestamp,
+                    reason: format!("{} (平多仓盈亏: {:.2})", decision.reason, pnl),
+                    pnl: Some(pnl),
+                    order_details: Some(format!("平多:{}, 开空:{}", close, open)),
+                })
+            }
+            Some(pos) => {
+                let new_total = pos.amount + trade_amount;
+                if new_total > max_position {
+                    Ok(hold_result(
+                        symbol,
+                        execution_price,
+                        timestamp,
+                        format!(
+                            "已达最大持仓 {:.4}/{:.4}，无法加仓",
+                            pos.amount, max_position
+                        ),
+                    ))
+                } else {
+                    let fill = open_short(symbol, trade_amount, api_key, secret).await?;
                     Ok(TradeResult {
                         symbol: symbol.to_string(),
                         action: TradeAction::OpenShort,
-                        price: execution_price,
-                        amount: trade_amount,
+                        price: filled_price(&fill, execution_price),
+                        amount: filled_qty(&fill, trade_amount),
                         timestamp,
-                        reason: decision.reason.clone(),
+                        reason: format!(
+                            "{} (加仓: {:.4} → {:.4})",
+                            decision.reason, pos.amount, new_total
+                        ),
                         pnl: None,
-                        order_details: Some(order_info),
+                        order_details: Some(fill.to_string()),
                     })
-                }
-                Some(pos) if pos.side == PositionSide::Long => {
-                    // 持有多仓 → 平多 → 开空
-                    let close_info = close_long(symbol, pos.amount, api_key, secret).await?;
-                    let pnl = (execution_price - pos.entry_price) * pos.amount;
-                    let open_info = open_short(symbol, trade_amount, api_key, secret).await?;
-                    Ok(TradeResult {
-                        symbol: symbol.to_string(),
-                        action: TradeAction::OpenShort,
-                        price: execution_price,
-                        amount: trade_amount,
-                        timestamp,
-                        reason: format!("{} (平多仓盈亏: {:.2})", decision.reason, pnl),
-                        pnl: Some(pnl),
-                        order_details: Some(format!("平多:{}, 开空:{}", close_info, open_info)),
-                    })
-                }
-                Some(pos) => {
-                    // 已持有空仓 → 检查是否可以加仓
-                    let new_total = pos.amount + trade_amount;
-                    if new_total > max_position {
-                        Ok(TradeResult {
-                            symbol: symbol.to_string(),
-                            action: TradeAction::Hold,
-                            price: execution_price,
-                            amount: 0.0,
-                            timestamp,
-                            reason: format!(
-                                "已达最大持仓 {:.4}/{:.4}，无法加仓",
-                                pos.amount, max_position
-                            ),
-                            pnl: None,
-                            order_details: None,
-                        })
-                    } else {
-                        // 加仓
-                        let order_info = open_short(symbol, trade_amount, api_key, secret).await?;
-                        Ok(TradeResult {
-                            symbol: symbol.to_string(),
-                            action: TradeAction::OpenShort,
-                            price: execution_price,
-                            amount: trade_amount,
-                            timestamp,
-                            reason: format!(
-                                "{} (加仓: {:.4} → {:.4})",
-                                decision.reason, pos.amount, new_total
-                            ),
-                            pnl: None,
-                            order_details: Some(order_info),
-                        })
-                    }
                 }
             }
-        }
+        },
     }
 }

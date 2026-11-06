@@ -9,6 +9,7 @@ mod logging;
 mod market;
 mod multi_agent;
 mod performance;
+mod risk;
 mod state;
 mod strategy;
 mod types;
@@ -291,6 +292,7 @@ async fn execute_symbol_cycle(
     constraints: &executor::SymbolConstraints,
     account: &executor::AccountInfo,
     config: &Config,
+    risk_guard: &risk::RiskGuard,
 ) -> Result<SymbolCycleResult> {
     info!("--- 决策执行: {} ---", analysis.symbol);
 
@@ -304,66 +306,92 @@ async fn execute_symbol_cycle(
         ),
     }
 
-    info!("--- 多智能体决策开始 ---");
+    // 确定性风控优先于 LLM：止损/止盈/熔断触发时直接平仓，不再调用模型
+    let forced_exit = analysis.position.as_ref().and_then(|pos| {
+        risk_guard
+            .exit_reason(pos)
+            .or_else(|| risk_guard.halt_exit_reason())
+    });
 
-    // 策略研究员
-    let strategy = multi_agent::strategy_researcher_suggest(
-        &analysis.symbol,
-        &analysis.market_report,
-        &analysis.position,
-        &config.deepseek_api_key,
-    )
-    .await?;
-    info!(
-        "策略研究员: {:?} | 时机评分: {}/10 | {}",
-        strategy.action, strategy.timing_score, strategy.reasoning
-    );
-    if let Some(pct) = strategy.target_position_pct {
-        info!("目标仓位占比: {:.2}%", pct * 100.0);
-    }
-    if let Some(sl) = strategy.stop_loss_pct {
-        info!("建议止损: {:.2}%", sl * 100.0);
-    }
-    if let Some(tp) = strategy.take_profit_pct {
-        info!("建议止盈: {:.2}%", tp * 100.0);
-    }
+    let decision = if let Some(reason) = forced_exit {
+        warn!("确定性风控触发，跳过 LLM 决策: {}", reason);
+        types::TradingDecision {
+            signal: types::Signal::Close,
+            reason,
+            confidence: types::Confidence::High,
+            amount: analysis.position.as_ref().map(|p| p.amount).unwrap_or(0.0),
+        }
+    } else {
+        info!("--- 多智能体决策开始 ---");
 
-    // 风险管理员
-    let risk = multi_agent::risk_manager_assess(
-        &analysis.symbol,
-        &analysis.market_report,
-        &strategy,
-        account,
-        &analysis.position,
-        constraints,
-        allocated_balance,
-        allocated_max_amount,
-        config.max_position,
-        &config.deepseek_api_key,
-    )
-    .await?;
-    info!(
-        "风险管理员: {:?} | 审批: {:?} | 建议数量: {:.4} | {}",
-        risk.risk_level, risk.approval, risk.suggested_amount, risk.reason
-    );
-    if !risk.warnings.is_empty() {
-        warn!("风险警告: {}", risk.warnings.join(", "));
-    }
+        // 策略研究员
+        let strategy = multi_agent::strategy_researcher_suggest(
+            &analysis.symbol,
+            &analysis.market_report,
+            &analysis.position,
+            &config.deepseek_api_key,
+        )
+        .await?;
+        info!(
+            "策略研究员: {:?} | 时机评分: {}/10 | {}",
+            strategy.action, strategy.timing_score, strategy.reasoning
+        );
+        if let Some(pct) = strategy.target_position_pct {
+            info!("目标仓位占比: {:.2}%", pct * 100.0);
+        }
+        if let Some(sl) = strategy.stop_loss_pct {
+            info!("建议止损: {:.2}%", sl * 100.0);
+        }
+        if let Some(tp) = strategy.take_profit_pct {
+            info!("建议止盈: {:.2}%", tp * 100.0);
+        }
 
-    // 决策交易员
-    let decision = multi_agent::trade_executor_decide(
-        &analysis.symbol,
-        &analysis.market_report,
-        &strategy,
-        &risk,
-        &config.deepseek_api_key,
-    )
-    .await?;
+        // 风险管理员
+        let risk = multi_agent::risk_manager_assess(
+            &analysis.symbol,
+            &analysis.market_report,
+            &strategy,
+            account,
+            &analysis.position,
+            constraints,
+            allocated_balance,
+            allocated_max_amount,
+            config.max_position,
+            &config.deepseek_api_key,
+        )
+        .await?;
+        info!(
+            "风险管理员: {:?} | 审批: {:?} | 建议数量: {:.4} | {}",
+            risk.risk_level, risk.approval, risk.suggested_amount, risk.reason
+        );
+        if !risk.warnings.is_empty() {
+            warn!("风险警告: {}", risk.warnings.join(", "));
+        }
+
+        // 决策交易员
+        let mut decision = multi_agent::trade_executor_decide(
+            &analysis.symbol,
+            &analysis.market_report,
+            &strategy,
+            &risk,
+            &config.deepseek_api_key,
+        )
+        .await?;
+        info!(
+            "决策交易员: {:?}, 数量: {:.4}, 信心: {:?} | {}",
+            decision.signal, decision.amount, decision.confidence, decision.reason
+        );
+
+        // 代码层的最后一道闸门：熔断期间不允许开启新敞口
+        risk_guard.gate(&mut decision, &analysis.position);
+        info!("--- 多智能体决策完成 ---");
+        decision
+    };
+
     info!(
-        "决策交易员: {:?}, 数量: {:.4}, 信心: {:?} | {}",
+        "最终决策: {:?}, 数量: {:.4}, 信心: {:?} | {}",
         decision.signal, decision.amount, decision.confidence, decision.reason
     );
-    info!("--- 多智能体决策完成 ---");
 
     state::log_decision(&analysis.symbol, &decision, &analysis.position)?;
 
@@ -376,31 +404,36 @@ async fn execute_symbol_cycle(
         let raw_price = market::fetch_current_price(&analysis.symbol).await?;
         let quoted_price = executor::quantize_price(raw_price, constraints.tick_size);
         info!("价格对齐: 原始 {:.6} → {:.6}", raw_price, quoted_price);
-        let maybe_trade_amount = adjust_trade_quantity(
-            decision.amount,
-            allocated_max_amount,
-            allocated_balance,
-            quoted_price,
-            constraints,
-        );
-
-        let trade_amount = match maybe_trade_amount {
-            Some(qty) => qty,
-            None => {
-                warn!(
-                    "无法满足交易约束，保持观望: 建议 {:.6}, 分配上限 {:.6}, 分配资金 {:.2} USDT, 价格 {:.6}",
-                    decision.amount, allocated_max_amount, allocated_balance, quoted_price
-                );
-                return Ok(SymbolCycleResult {
-                    traded: false,
-                    account_snapshot: Some(account.clone()),
-                    position_snapshot: analysis.position.clone(),
-                    trade_result: None,
-                });
+        // 平仓使用交易所返回的实际持仓量，不受开仓约束影响
+        let trade_amount = if decision.signal == types::Signal::Close {
+            analysis.position.as_ref().map(|p| p.amount).unwrap_or(0.0)
+        } else {
+            match adjust_trade_quantity(
+                decision.amount,
+                allocated_max_amount,
+                allocated_balance,
+                quoted_price,
+                constraints,
+            ) {
+                Some(qty) => qty,
+                None => {
+                    warn!(
+                        "无法满足交易约束，保持观望: 建议 {:.6}, 分配上限 {:.6}, 分配资金 {:.2} USDT, 价格 {:.6}",
+                        decision.amount, allocated_max_amount, allocated_balance, quoted_price
+                    );
+                    return Ok(SymbolCycleResult {
+                        traded: false,
+                        account_snapshot: Some(account.clone()),
+                        position_snapshot: analysis.position.clone(),
+                        trade_result: None,
+                    });
+                }
             }
         };
 
-        if (trade_amount - decision.amount).abs() > f64::EPSILON {
+        if decision.signal != types::Signal::Close
+            && (trade_amount - decision.amount).abs() > f64::EPSILON
+        {
             warn!(
                 "交易数量根据约束调整: 建议 {:.6} → {:.6}",
                 decision.amount, trade_amount
@@ -486,6 +519,7 @@ async fn run_portfolio_cycle(
     constraints_map: &std::collections::HashMap<String, executor::SymbolConstraints>,
     symbols_cache: &mut std::collections::HashMap<String, SymbolCacheEntry>,
     performance_tracker: &mut PerformanceTracker,
+    risk_guard: &mut risk::RiskGuard,
 ) -> Result<bool> {
     info!("============================================================");
     info!(
@@ -530,6 +564,21 @@ async fn run_portfolio_cycle(
         executor::get_account_info(&config.binance_api_key, &config.binance_secret).await?;
     let total_balance: f64 = current_account.availableBalance.parse().unwrap_or(0.0);
     info!("总可用资金: {} USDT", total_balance);
+
+    // 用钱包总余额衡量权益：可用余额会随保证金占用波动，不适合做回撤基准
+    let wallet_equity: f64 = current_account
+        .totalWalletBalance
+        .parse()
+        .unwrap_or(total_balance);
+    if let Some(reason) = risk_guard.observe_equity(wallet_equity) {
+        error!("风控熔断: {}", reason);
+    }
+    if risk_guard.halted() {
+        warn!(
+            "当前处于熔断状态，仅允许平仓/止损: {}",
+            risk_guard.halt_reason().unwrap_or("trading halted")
+        );
+    }
 
     let mut portfolio_allocation = multi_agent::portfolio_coordinator_allocate(
         &symbols_reports,
@@ -644,6 +693,7 @@ async fn run_portfolio_cycle(
             &constraint,
             &current_account,
             config,
+            risk_guard,
         )
         .await
         {
@@ -694,6 +744,10 @@ async fn run_portfolio_cycle(
             .entry(symbol)
             .or_insert_with(SymbolCacheEntry::empty)
             .update(analysis.position.clone());
+    }
+
+    if let Err(err) = risk_guard.persist() {
+        warn!("保存风控状态失败: {:#}", err);
     }
 
     Ok(any_traded)
@@ -832,6 +886,23 @@ async fn run_live() -> Result<()> {
     let mut symbols_cache: std::collections::HashMap<String, SymbolCacheEntry> =
         std::collections::HashMap::new();
     let mut performance_tracker = PerformanceTracker::load();
+    let mut risk_guard = risk::RiskGuard::load(risk::RiskLimits::from_env());
+    let limits = &risk_guard.limits;
+    info!(
+        "风控: enabled={} | 止损 {:.2}% | 止盈 {:.2}% | 最大回撤 {:.2}% | 日内亏损 {:.2}% | 熔断平仓={}",
+        limits.enabled,
+        limits.stop_loss_pct * 100.0,
+        limits.take_profit_pct * 100.0,
+        limits.max_drawdown_pct * 100.0,
+        limits.daily_loss_pct * 100.0,
+        limits.close_on_halt
+    );
+    if risk_guard.halted() {
+        warn!(
+            "历史风控状态为熔断: {}。请确认后删除 logs/risk_state.json 再重启以恢复交易。",
+            risk_guard.halt_reason().unwrap_or("trading halted")
+        );
+    }
 
     let snapshot = performance_tracker.snapshot();
     if snapshot.total_trades > 0 {
@@ -853,6 +924,7 @@ async fn run_live() -> Result<()> {
             &symbol_constraints,
             &mut symbols_cache,
             &mut performance_tracker,
+            &mut risk_guard,
         )
         .await
         {

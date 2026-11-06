@@ -2,115 +2,40 @@
 
 所有值得注意的变更都记录在这里。版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased] — v0.9.0
+## [0.3.0] - 2026-11-06
+
+把项目从“能回测”推进到“能被验证、能被看见”。
 
 ### Added
 
-- **策略基准排行榜**：`trade benchmark`
-  - 同一区间、成本、walk-forward 窗口下比较 SMA / 随机基线 / 单智能体 LLM / 买入持有
-  - 输出可直接贴进 README 的 Markdown 表格 + JSON
-  - LLM 为可选项（`--strategies ...,llm`，每个测试 bar 一次模型调用）
-- **随机基线策略**：固定种子、可复现，用来回答“LLM 比随机猜好多少”
-- Walk-forward 泛化为策略族（`StrategyFamily::{Sma, Random, Llm}`），报告新增 `strategy` 字段
-- 非参数搜索策略的训练指标改为可选（`Option`）
-
-## [Unreleased] — v0.8.0
-
-### Added
-
-- **离线 Demo**：`trade demo`，无需 API key / 网络
-  - 使用仓库内置的 BTCUSDT 1h 样本跑 SMA 回测
-  - 自动生成 Dashboard 所需的 `status / equity / trades / decisions / performance` 日志
-  - 启动 Dashboard 并展示组合权益、决策、成交和回测结果
-- **Agent 决策链追踪**
-  - 每个智能体阶段写入 `logs/agent_trace.jsonl`：阶段、模型、缓存命中、耗时、prompt/completion tokens、完整输出
-  - Dashboard 新增「Agent 决策流」面板，可展开查看每一步 JSON
-  - `trade analyze --symbol BTCUSDT`：dry-run 跑完整决策链，不下单，用于调试 prompt 和生成 trace
-  - 仓库内置 `examples/agent_trace.sample.jsonl`（真实 DeepSeek 运行录制）
-- LLM 客户端返回 `LlmMeta`（耗时 / token），所有智能体调用都会记录
-
-## [Unreleased] — v0.7.0
-
-### Added
-
-- **Walk-forward 样本外回测**（`src/walkforward.rs`）
-  - 滚动切分训练 / 测试窗口，训练段遍历 fast/slow 网格选参，测试段只使用没见过的数据
-  - 多标的等权组合，输出单标的与组合的 OOS 收益、回撤、Sharpe、胜率和买入持有对照
-  - 新增 `trade walkforward` 子命令，报告写入 JSON + 组合权益曲线 CSV
-- SMA 策略支持任意 fast/slow 周期（直接从K线窗口计算）
-- 回测引擎拆出 `run_segment`，可对任意K线片段复用
-- 训练窗口的最后一笔成交不再越界到测试窗口第一根K线
+- **显式平仓语义**：新增 `Signal::Close`，可以退出到空仓而不必反手；LLM 交易员、SMA 基线和回测都支持 `CLOSE`
+- **确定性风控**（`src/risk.rs`）
+  - 止损 / 止盈按开仓名义价值计算，触发时跳过 LLM 直接平仓
+  - 最大回撤熔断（默认 20%）与日内亏损熔断（默认 5%），状态持久化到 `logs/risk_state.json`
+  - 风险管理员改为代码：`risk::assess` + `risk::enforce`，交易员 LLM 不能覆盖风控结论
+- **交易所条件单**：开仓后挂 `STOP_MARKET` / `TAKE_PROFIT_MARKET`（`closePosition=true`），盘中由交易所触发；已有且价格一致时复用
+- **只读 Dashboard**（axum + 单页 HTML）：权益曲线、持仓、风控、决策 / 成交、回测浏览、Agent 决策流；默认只绑定 `127.0.0.1`
+- **Walk-forward 样本外回测**：滚动训练 / 测试窗口，训练段搜索 fast/slow，测试段只评估未见过数据；多标的等权组合
+- **Agent 决策链**：每个阶段记录模型、耗时、tokens、完整 JSON 输出；`trade analyze` 可 dry-run 跑完整链路
+- **策略基准排行榜**：SMA walk-forward / 随机基线 / LLM / 买入持有，同窗口同成本，输出 Markdown
+- **离线 Demo**：`trade demo`，无需 API key 或网络，跑内置样本并启动 Dashboard
+- **LLM 可靠性**：JSON 模式、超时、重试、解析失败重试、模型感知缓存；模型 / 温度 / 超时均可配置
+- **随机基线策略**：固定种子，可复现
+- 回测盘中止损止盈、下单 `newClientOrderId` 幂等、真实成交价解析
+- 69 个单元测试、CI（fmt / clippy / test / build）、MIT LICENSE、示例数据与 trace
 
 ### Changed
 
-- `compute_metrics` 改为接收买入持有收益，减少参数耦合
-
-## [Unreleased] — v0.6.0
-
-### Added
-
-- **LLM 请求可靠性**
-  - 默认开启 JSON 模式（`response_format=json_object`）
-  - 单次请求超时（默认 60 秒）与重试（默认 1 次）
-  - JSON 解析失败时自动作废缓存并重新请求一次
-  - 模型、温度、超时、重试均可配置：`DEEPSEEK_MODEL`、`LLM_TEMPERATURE`、`LLM_TIMEOUT_SECS`、`LLM_MAX_RETRIES`、`LLM_JSON_MODE`
-  - 缓存键包含模型、base URL、温度和 JSON 模式，换模型不会误用旧响应
-
-### Changed
-
-- **风险管理员改为确定性代码**（`risk::assess`）：按时机评分、ATR、趋势一致性、仓位上限和交易所约束计算 `RiskAssessment`，不再调用 LLM
-  - 交易员 LLM 的结论由 `risk::enforce` 强制约束：`rejected` 直接 HOLD，`adjusted` 数量被截断
-- 每个标的的模型调用从 3 次降到 2 次（策略 + 交易员），整轮从 `4N+1` 降到 `3N+1`
-- 所有智能体改用 `chat_json`，统一 JSON 解析与失败重试
-
-## [Unreleased] — v0.5.0
-
-### Added
-
-- **只读 Dashboard**（`src/dashboard.rs` + `src/dashboard.html`）
-  - `trade dashboard --port 8080` 独立启动，或 `trade run --dashboard 8080` 随交易循环启动
-  - 账户权益曲线、当前持仓、风控状态、最近决策 / 成交、回测结果浏览
-  - 每周期写入 `logs/status.json`（原子替换）与 `logs/equity.jsonl`
-  - 只读、默认绑定 `127.0.0.1`；回测文件查询做了目录穿越校验
-
-## [Unreleased] — v0.4.0
-
-### Added
-
-- **交易所条件单**：开仓后在 Binance 挂 `STOP_MARKET` / `TAKE_PROFIT_MARKET`（`closePosition=true`），由交易所在盘中触发，不再只依赖每个周期轮询
-  - 已有且触发价一致时复用，避免每轮撤单重挂
-  - 平仓到空仓后自动清理残留条件单
-  - 条件单失败时本地风控仍然兜底
-  - `RISK_EXCHANGE_STOPS` 控制开关，`RISK_TRIGGER_TYPE` 选择 `MARK_PRICE` / `CONTRACT_PRICE`
-- 纯函数 `protective_prices` 与撤单/挂单接口，含单元测试
+- 每个标的每轮模型调用从 3 次降到 2 次（策略 + 交易员），整轮从 `4N+1` 降到 `3N+1`
+- `SmaCross` 支持任意 fast/slow；均线粘合时有仓位则平仓观望
+- 回测引擎拆出 `run_segment`，可在任意片段复用
+- `trade` 无子命令时仍保持原有实盘行为
 
 ### Fixed
 
-- 移除持仓缓存：每轮都从交易所读取真实持仓。原缓存的过期判断实际总是命中，
-  条件单在周期之间触发后，程序仍会拿旧仓位做决策。
-
-## [0.3.0] — 未发布（本地提交）
-
-### Added
-
-- **显式平仓语义**：新增 `Signal::Close`，可以退出到空仓，而不必反手。
-  - LLM 交易员与回测策略都支持 `CLOSE`
-  - 熔断期间的反向信号会被降级为 `CLOSE`，而不是开新仓
-- **确定性风控层**（`src/risk.rs`）
-  - 止损 / 止盈：按开仓名义价值计算，触发时跳过 LLM 直接平仓
-  - 最大回撤熔断（默认 20%）与日内亏损熔断（默认 5%）
-  - 熔断状态持久化到 `logs/risk_state.json`；回撤熔断需人工删除状态文件后重启才解除
-  - 熔断期间禁止开仓 / 加仓，只允许平仓
-- 回测支持**盘中**止损止盈：用 K 线高低点判断触发，跳空按开盘价成交
-- 回测新增 `--stop-loss-pct` / `--take-profit-pct`
-- 下单使用 `newClientOrderId`：网络重试幂等，不会重复下单
-- 解析订单 `avgPrice` / `executedQty`，盈亏按真实成交价计算；未返回时回查订单
-
-### Changed
-
-- `SmaCross` 基线在均线粘合时：有仓位则 `CLOSE` 观望，空仓则 `HOLD`
-- 回测跳过低信心的**入场**信号，但平仓信号始终执行
-- 实盘下单失败对 5xx / 网络错误重试 3 次，4xx 业务错误直接返回
+- 移除总是命中的持仓缓存：每轮从交易所读取真实持仓，避免条件单触发后仍基于旧仓位决策
+- 修复 K 线请求对 HTTP 5xx 不重试、API key 前缀日志 panic、绩效重启归零
+- 训练窗口最后一笔成交不再越界到测试窗口
 
 ## [0.2.0] - 2026-11-06
 

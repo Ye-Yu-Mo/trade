@@ -1,5 +1,5 @@
 use crate::types::{Position, PositionSide, Signal, TradeAction, TradeResult, TradingDecision};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use futures::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use log::{debug, warn};
@@ -812,6 +812,335 @@ async fn close_short(symbol: &str, amount: f64, api_key: &str, secret: &str) -> 
     place_order(symbol, "BUY", "SHORT", amount, &id, api_key, secret).await
 }
 
+// ===== 交易所条件单：止损 / 止盈 =====
+//
+// 本地风控每个周期检查一次，极端行情下会滑价。挂 closePosition 条件单作为兜底，
+// 由交易所在盘中触发，不受轮询间隔影响。
+
+const PROTECTIVE_PREFIX: &str = "risk-";
+const PROTECTIVE_SL_PREFIX: &str = "risk-sl-";
+const PROTECTIVE_TP_PREFIX: &str = "risk-tp-";
+
+#[derive(Debug, Deserialize)]
+#[allow(non_snake_case)]
+struct OpenOrder {
+    orderId: i64,
+    clientOrderId: String,
+    positionSide: String,
+    stopPrice: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProtectiveConfig<'a> {
+    pub stop_loss_pct: f64,
+    pub take_profit_pct: f64,
+    pub trigger_type: &'a str,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ProtectiveOrders {
+    pub stop_loss: Option<OrderFill>,
+    pub take_profit: Option<OrderFill>,
+    pub reused: bool,
+}
+
+/// 计算（并量化）止损 / 止盈触发价。
+pub fn protective_prices(
+    side: &PositionSide,
+    entry: f64,
+    stop_loss_pct: f64,
+    take_profit_pct: f64,
+    tick_size: f64,
+) -> (Option<f64>, Option<f64>) {
+    if entry <= 0.0 {
+        return (None, None);
+    }
+
+    let stop = if stop_loss_pct > 0.0 {
+        let raw = match side {
+            PositionSide::Long => entry * (1.0 - stop_loss_pct),
+            PositionSide::Short => entry * (1.0 + stop_loss_pct),
+        };
+        Some(quantize_price(raw, tick_size))
+    } else {
+        None
+    };
+
+    let take = if take_profit_pct > 0.0 {
+        let raw = match side {
+            PositionSide::Long => entry * (1.0 + take_profit_pct),
+            PositionSide::Short => entry * (1.0 - take_profit_pct),
+        };
+        Some(quantize_price(raw, tick_size))
+    } else {
+        None
+    };
+
+    (stop, take)
+}
+
+fn side_label(side: &PositionSide) -> &'static str {
+    match side {
+        PositionSide::Long => "LONG",
+        PositionSide::Short => "SHORT",
+    }
+}
+
+fn close_side(side: &PositionSide) -> &'static str {
+    match side {
+        PositionSide::Long => "SELL",
+        PositionSide::Short => "BUY",
+    }
+}
+
+fn protective_order_matches(
+    order: &OpenOrder,
+    client_prefix: &str,
+    position_side: &str,
+    price: f64,
+    tick_size: f64,
+) -> bool {
+    if !order.clientOrderId.starts_with(client_prefix) || order.positionSide != position_side {
+        return false;
+    }
+    let Ok(existing) = order.stopPrice.parse::<f64>() else {
+        return false;
+    };
+    let tolerance = if tick_size > 0.0 {
+        tick_size
+    } else {
+        (price.abs() * 1e-9).max(1e-9)
+    };
+    (existing - price).abs() <= tolerance
+}
+
+async fn list_open_orders(symbol: &str, api_key: &str, secret: &str) -> Result<Vec<OpenOrder>> {
+    let timestamp = get_timestamp();
+    let query_string = format!("symbol={}&timestamp={}", symbol, timestamp);
+    let signature = generate_signature(&query_string, secret);
+    let url = format!(
+        "{}/fapi/v1/openOrders?{}&signature={}",
+        get_binance_base_url(),
+        query_string,
+        signature
+    );
+
+    let response = reqwest::Client::new()
+        .get(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .context("查询挂单失败")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!("查询挂单失败 [{}]: {}", status, body);
+    }
+
+    response.json().await.context("解析挂单失败")
+}
+
+async fn cancel_order(symbol: &str, order_id: i64, api_key: &str, secret: &str) -> Result<()> {
+    let timestamp = get_timestamp();
+    let query_string = format!(
+        "symbol={}&orderId={}&timestamp={}",
+        symbol, order_id, timestamp
+    );
+    let signature = generate_signature(&query_string, secret);
+    let url = format!(
+        "{}/fapi/v1/order?{}&signature={}",
+        get_binance_base_url(),
+        query_string,
+        signature
+    );
+
+    let response = reqwest::Client::new()
+        .delete(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .context("撤销订单失败")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!("撤销订单失败 [{}]: {}", status, body);
+    }
+
+    Ok(())
+}
+
+/// 撤销该标的所有本机器人挂出的保护单。返回撤销数量。
+pub async fn cancel_protective_orders(symbol: &str, api_key: &str, secret: &str) -> Result<usize> {
+    let orders = list_open_orders(symbol, api_key, secret).await?;
+    let mut cancelled = 0;
+    for order in orders {
+        if order.clientOrderId.starts_with(PROTECTIVE_PREFIX) {
+            cancel_order(symbol, order.orderId, api_key, secret).await?;
+            cancelled += 1;
+        }
+    }
+    Ok(cancelled)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn place_protective_order(
+    symbol: &str,
+    side: &str,
+    position_side: &str,
+    order_type: &str,
+    stop_price: f64,
+    client_order_id: &str,
+    trigger_type: &str,
+    api_key: &str,
+    secret: &str,
+) -> Result<OrderFill> {
+    let timestamp = get_timestamp();
+    let query_string = format!(
+        "symbol={}&side={}&positionSide={}&type={}&stopPrice={}&closePosition=true&workingType={}&newClientOrderId={}&timestamp={}",
+        symbol, side, position_side, order_type, stop_price, trigger_type, client_order_id, timestamp
+    );
+    let signature = generate_signature(&query_string, secret);
+    let url = format!(
+        "{}/fapi/v1/order?{}&signature={}",
+        get_binance_base_url(),
+        query_string,
+        signature
+    );
+
+    let response = reqwest::Client::new()
+        .post(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .context("提交条件单失败")?;
+
+    let status = response.status();
+    let text = response.text().await.context("读取条件单响应失败")?;
+    if !status.is_success() {
+        if let Ok(error) = serde_json::from_str::<BinanceError>(&text) {
+            bail!(
+                "条件单失败 [code:{}]: {}",
+                error.code.unwrap_or(-1),
+                error.msg.unwrap_or_else(|| "未知错误".to_string())
+            );
+        }
+        bail!("条件单失败 [{}]: {}", status, text);
+    }
+
+    parse_order_fill(&text).context("解析条件单响应失败")
+}
+
+/// 确保持仓有对应的止损/止盈条件单。
+///
+/// - 已存在且触发价一致时复用，避免每轮撤单重挂
+/// - 缺失或价格不符时，先撤掉旧的保护单再重挂
+pub async fn ensure_protective_orders(
+    symbol: &str,
+    position: &Position,
+    config: &ProtectiveConfig<'_>,
+    constraints: &SymbolConstraints,
+    api_key: &str,
+    secret: &str,
+) -> Result<ProtectiveOrders> {
+    let (stop_price, take_price) = protective_prices(
+        &position.side,
+        position.entry_price,
+        config.stop_loss_pct,
+        config.take_profit_pct,
+        constraints.tick_size,
+    );
+
+    if stop_price.is_none() && take_price.is_none() {
+        return Ok(ProtectiveOrders::default());
+    }
+
+    let position_side = side_label(&position.side);
+    let existing = list_open_orders(symbol, api_key, secret).await?;
+
+    let stop_valid = stop_price.is_none_or(|price| {
+        existing.iter().any(|order| {
+            protective_order_matches(
+                order,
+                PROTECTIVE_SL_PREFIX,
+                position_side,
+                price,
+                constraints.tick_size,
+            )
+        })
+    });
+    let take_valid = take_price.is_none_or(|price| {
+        existing.iter().any(|order| {
+            protective_order_matches(
+                order,
+                PROTECTIVE_TP_PREFIX,
+                position_side,
+                price,
+                constraints.tick_size,
+            )
+        })
+    });
+
+    if stop_valid && take_valid {
+        return Ok(ProtectiveOrders {
+            stop_loss: None,
+            take_profit: None,
+            reused: true,
+        });
+    }
+
+    for order in &existing {
+        if order.clientOrderId.starts_with(PROTECTIVE_PREFIX) {
+            if let Err(err) = cancel_order(symbol, order.orderId, api_key, secret).await {
+                warn!("撤销旧保护单失败 ({}): {:#}", order.orderId, err);
+            }
+        }
+    }
+
+    let timestamp = get_timestamp();
+    let side = close_side(&position.side);
+    let mut result = ProtectiveOrders::default();
+
+    if let Some(price) = stop_price {
+        let id = format!("{}{}", PROTECTIVE_SL_PREFIX, timestamp);
+        result.stop_loss = Some(
+            place_protective_order(
+                symbol,
+                side,
+                position_side,
+                "STOP_MARKET",
+                price,
+                &id,
+                config.trigger_type,
+                api_key,
+                secret,
+            )
+            .await?,
+        );
+    }
+
+    if let Some(price) = take_price {
+        let id = format!("{}{}", PROTECTIVE_TP_PREFIX, timestamp);
+        result.take_profit = Some(
+            place_protective_order(
+                symbol,
+                side,
+                position_side,
+                "TAKE_PROFIT_MARKET",
+                price,
+                &id,
+                config.trigger_type,
+                api_key,
+                secret,
+            )
+            .await?,
+        );
+    }
+
+    Ok(result)
+}
+
 fn filled_price(fill: &OrderFill, fallback: f64) -> f64 {
     fill.avg_price.unwrap_or(fallback)
 }
@@ -1022,5 +1351,78 @@ pub async fn execute_decision(
                 }
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protective_prices_long_and_short() {
+        let (sl, tp) = protective_prices(&PositionSide::Long, 100.0, 0.02, 0.05, 0.0);
+        assert!((sl.unwrap() - 98.0).abs() < 1e-9);
+        assert!((tp.unwrap() - 105.0).abs() < 1e-9);
+
+        let (sl, tp) = protective_prices(&PositionSide::Short, 100.0, 0.02, 0.05, 0.0);
+        assert!((sl.unwrap() - 102.0).abs() < 1e-9);
+        assert!((tp.unwrap() - 95.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn protective_prices_respect_disabled_limits() {
+        let (sl, tp) = protective_prices(&PositionSide::Long, 100.0, 0.0, 0.0, 0.0);
+        assert!(sl.is_none());
+        assert!(tp.is_none());
+    }
+
+    #[test]
+    fn protective_prices_quantize_to_tick() {
+        let (sl, _) = protective_prices(&PositionSide::Long, 100.0, 0.02, 0.0, 0.5);
+        assert_eq!(sl, Some(98.0));
+    }
+
+    #[test]
+    fn matches_only_matching_prefix_side_and_price() {
+        let order = OpenOrder {
+            orderId: 1,
+            clientOrderId: "risk-sl-123".into(),
+            positionSide: "LONG".into(),
+            stopPrice: "98.0".into(),
+        };
+        assert!(protective_order_matches(
+            &order,
+            PROTECTIVE_SL_PREFIX,
+            "LONG",
+            98.0,
+            0.1
+        ));
+        assert!(!protective_order_matches(
+            &order,
+            PROTECTIVE_TP_PREFIX,
+            "LONG",
+            98.0,
+            0.1
+        ));
+        assert!(!protective_order_matches(
+            &order,
+            PROTECTIVE_SL_PREFIX,
+            "SHORT",
+            98.0,
+            0.1
+        ));
+        assert!(!protective_order_matches(
+            &order,
+            PROTECTIVE_SL_PREFIX,
+            "LONG",
+            97.0,
+            0.1
+        ));
+    }
+
+    #[test]
+    fn client_order_id_fits_binance_limit() {
+        let id = client_order_id("BTCUSDT", "ol");
+        assert!(id.len() <= 36, "id too long: {}", id);
     }
 }

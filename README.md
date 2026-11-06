@@ -282,15 +282,19 @@ System calculates the following technical indicators:
 
 - **Stop-loss / take-profit**: default 2% / 5% of entry notional. When hit, the position is closed
   by code without calling the LLM.
+- **Exchange conditional orders**: while a position is open, the bot keeps `STOP_MARKET` /
+  `TAKE_PROFIT_MARKET` orders (`closePosition=true`) on Binance, triggering intrabar. Existing orders
+  are reused when the trigger price still matches.
 - **Circuit breakers**: new positions are blocked when equity draws down 20% from its peak or loses
   5% in a day. Existing positions are force-closed by default.
 - **Persisted state**: `logs/risk_state.json`. A daily-loss halt clears on the next UTC day; a
   drawdown halt requires deleting the file and restarting.
 - **Configuration**: `RISK_ENABLED`, `RISK_STOP_LOSS_PCT`, `RISK_TAKE_PROFIT_PCT`,
-  `RISK_MAX_DRAWDOWN_PCT`, `RISK_DAILY_LOSS_PCT`, `RISK_CLOSE_ON_HALT`.
+  `RISK_MAX_DRAWDOWN_PCT`, `RISK_DAILY_LOSS_PCT`, `RISK_CLOSE_ON_HALT`, `RISK_EXCHANGE_STOPS`,
+  `RISK_TRIGGER_TYPE`.
 
-Live risk checks run once per trading cycle; no exchange conditional orders are placed yet, so
-extreme moves can slip.
+Live trading has two layers: a per-cycle local check and exchange-side conditional orders. Conditional
+orders can still slip in extreme gaps, and if placing one fails the local check is the only fallback.
 
 ## Known Limitations
 
@@ -299,8 +303,8 @@ These are real, and they matter more than the feature list:
 1. **The backtest is simplified.** It ignores funding rates, margin liquidation, order-book impact
    and partial fills. Intrabar stops are inferred from bar high/low; the true order inside a bar is
    unknowable. Entries fill at the next bar open with fixed slippage.
-2. **Live risk checks are per-cycle.** Stops and take-profits are evaluated once per cycle (1 minute
-   by default) with no exchange-side conditional orders.
+2. **Conditional orders are not a guarantee.** They fill at the mark/last price against available
+   liquidity and can slip in extreme gaps; if placement fails, only the per-cycle local check remains.
 3. **LLM decisions are non-deterministic.** The same bar can produce different signals. The cache
    avoids repeated charges, not variance. Measure a strategy over many runs before believing it.
 4. **No edge is claimed.** A naive SMA baseline and an LLM baseline are both included precisely so
@@ -375,6 +379,7 @@ src/
 ├── cli.rs           Command line interface (clap)
 ├── backtest.rs      Paper broker, backtest engine, metrics
 ├── strategy.rs      Pluggable strategies: SMA cross, LLM baseline
+├── risk.rs          Deterministic stops, circuit breakers, risk state
 ├── data.rs          Historical K-line download and local cache
 ├── llm_client.rs    DeepSeek client, response cache, JSON parsing
 ├── multi_agent.rs   Analyst / strategist / risk manager / executor / coordinator

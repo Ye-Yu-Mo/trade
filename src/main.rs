@@ -15,7 +15,6 @@ mod strategy;
 mod types;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use clap::Parser;
 use dotenvy::dotenv;
 use futures::future::try_join_all;
@@ -28,7 +27,6 @@ use tokio::time::{interval, Duration};
 struct SymbolCycleResult {
     traded: bool, // 是否执行了交易
     account_snapshot: Option<executor::AccountInfo>,
-    position_snapshot: Option<types::Position>,
     trade_result: Option<types::TradeResult>,
 }
 
@@ -37,33 +35,6 @@ struct SymbolAnalysis {
     symbol: String,
     position: Option<types::Position>,
     market_report: types::MarketReport,
-}
-
-#[derive(Clone, Debug)]
-struct SymbolCacheEntry {
-    position: Option<types::Position>,
-    last_updated: Option<DateTime<Utc>>,
-}
-
-impl SymbolCacheEntry {
-    fn empty() -> Self {
-        SymbolCacheEntry {
-            position: None,
-            last_updated: None,
-        }
-    }
-
-    fn update(&mut self, position: Option<types::Position>) {
-        self.position = position;
-        self.last_updated = Some(Utc::now());
-    }
-
-    fn should_use_cache(&self, now: DateTime<Utc>, max_age_secs: u64) -> bool {
-        match self.last_updated {
-            Some(last) => now.signed_duration_since(last).num_seconds() <= max_age_secs as i64,
-            None => false,
-        }
-    }
 }
 
 fn adjust_trade_quantity(
@@ -204,8 +175,6 @@ async fn analyze_symbol(
     symbol: String,
     config: &Config,
     interval_str: &str,
-    use_cache: bool,
-    cached_position: Option<types::Position>,
 ) -> Result<SymbolAnalysis> {
     info!("--- 分析标的: {} ---", symbol);
 
@@ -231,33 +200,17 @@ async fn analyze_symbol(
         indicators.volume_ratio
     );
 
-    // 3. 获取持仓（优先使用缓存）
-    let position = if use_cache {
-        match cached_position {
-            None => {
-                info!("当前持仓: 空仓 (缓存)");
-                None
-            }
-            Some(pos) => {
-                info!(
-                    "当前持仓: {:?}仓 {:.4}, 盈亏: {:.2} USDT (缓存)",
-                    pos.side, pos.amount, pos.unrealized_pnl
-                );
-                Some(pos)
-            }
-        }
-    } else {
-        let pos = executor::get_position(&symbol, &config.binance_api_key, &config.binance_secret)
-            .await?;
-        match &pos {
-            None => info!("当前持仓: 空仓"),
-            Some(p) => info!(
-                "当前持仓: {:?}仓 {:.4}, 盈亏: {:.2} USDT",
-                p.side, p.amount, p.unrealized_pnl
-            ),
-        }
-        pos
-    };
+    // 3. 获取持仓。每轮都从交易所读取：条件单可能在周期之间改变持仓，
+    //    缓存一次错误会让后续决策全部建立在假仓位之上。
+    let position =
+        executor::get_position(&symbol, &config.binance_api_key, &config.binance_secret).await?;
+    match &position {
+        None => info!("当前持仓: 空仓"),
+        Some(pos) => info!(
+            "当前持仓: {:?}仓 {:.4}, 盈亏: {:.2} USDT",
+            pos.side, pos.amount, pos.unrealized_pnl
+        ),
+    }
 
     // 4. 行情分析
     info!("--- 行情分析员决策 ---");
@@ -398,6 +351,7 @@ async fn execute_symbol_cycle(
     let mut traded = false;
     let mut account_snapshot = Some(account.clone());
     let mut position_snapshot = analysis.position.clone();
+    let mut position_verified = true;
     let mut latest_trade_result = None;
 
     if decision.signal != types::Signal::Hold {
@@ -424,7 +378,6 @@ async fn execute_symbol_cycle(
                     return Ok(SymbolCycleResult {
                         traded: false,
                         account_snapshot: Some(account.clone()),
-                        position_snapshot: analysis.position.clone(),
                         trade_result: None,
                     });
                 }
@@ -438,6 +391,19 @@ async fn execute_symbol_cycle(
                 "交易数量根据约束调整: 建议 {:.6} → {:.6}",
                 decision.amount, trade_amount
             );
+        }
+
+        // 平仓前先撤条件单，避免本地平仓与交易所触发同时发生
+        if decision.signal == types::Signal::Close {
+            if let Err(err) = executor::cancel_protective_orders(
+                &analysis.symbol,
+                &config.binance_api_key,
+                &config.binance_secret,
+            )
+            .await
+            {
+                warn!("平仓前撤销保护单失败: {:#}", err);
+            }
         }
 
         match executor::execute_decision(
@@ -474,14 +440,23 @@ async fn execute_symbol_cycle(
                         executor::get_account_info(&config.binance_api_key, &config.binance_secret)
                             .await
                             .ok();
-                    position_snapshot = executor::get_position(
+                    match executor::get_position(
                         &analysis.symbol,
                         &config.binance_api_key,
                         &config.binance_secret,
                     )
                     .await
-                    .ok()
-                    .flatten();
+                    {
+                        Ok(position) => {
+                            position_snapshot = position;
+                            position_verified = true;
+                        }
+                        Err(err) => {
+                            // 查询失败不等于空仓：保留旧快照，避免误撤保护单
+                            warn!("交易后刷新持仓失败，保留旧快照: {:#}", err);
+                            position_verified = false;
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -504,10 +479,62 @@ async fn execute_symbol_cycle(
         info!("保持观望");
     }
 
+    // 交易所条件单：有仓位就确保持仓有止损/止盈兜底；回到空仓则清理残留
+    if risk_guard.limits.exchange_stops && position_verified {
+        match &position_snapshot {
+            Some(position) => {
+                let protective = executor::ProtectiveConfig {
+                    stop_loss_pct: risk_guard.limits.stop_loss_pct,
+                    take_profit_pct: risk_guard.limits.take_profit_pct,
+                    trigger_type: &risk_guard.limits.trigger_type,
+                };
+                match executor::ensure_protective_orders(
+                    &analysis.symbol,
+                    position,
+                    &protective,
+                    constraints,
+                    &config.binance_api_key,
+                    &config.binance_secret,
+                )
+                .await
+                {
+                    Ok(orders) if orders.reused => {
+                        info!("保护单已存在: {}", analysis.symbol);
+                    }
+                    Ok(orders) => {
+                        if let Some(stop_loss) = &orders.stop_loss {
+                            info!("已挂止损: {}", stop_loss);
+                        }
+                        if let Some(take_profit) = &orders.take_profit {
+                            info!("已挂止盈: {}", take_profit);
+                        }
+                    }
+                    Err(err) => {
+                        warn!("挂保护单失败，仍由本地风控兜底: {:#}", err);
+                    }
+                }
+            }
+            None => {
+                if traded {
+                    match executor::cancel_protective_orders(
+                        &analysis.symbol,
+                        &config.binance_api_key,
+                        &config.binance_secret,
+                    )
+                    .await
+                    {
+                        Ok(count) if count > 0 => info!("已撤销 {} 个残留保护单", count),
+                        Ok(_) => {}
+                        Err(err) => warn!("撤销保护单失败: {:#}", err),
+                    }
+                }
+            }
+        }
+    }
+
     Ok(SymbolCycleResult {
         traded,
         account_snapshot,
-        position_snapshot,
         trade_result: latest_trade_result,
     })
 }
@@ -517,7 +544,6 @@ async fn run_portfolio_cycle(
     config: &Config,
     interval_str: &str,
     constraints_map: &std::collections::HashMap<String, executor::SymbolConstraints>,
-    symbols_cache: &mut std::collections::HashMap<String, SymbolCacheEntry>,
     performance_tracker: &mut PerformanceTracker,
     risk_guard: &mut risk::RiskGuard,
 ) -> Result<bool> {
@@ -530,25 +556,9 @@ async fn run_portfolio_cycle(
 
     // 1. 获取所有标的的行情分析
     info!("=== 第一阶段：行情分析 (并行) ===");
-    let now = Utc::now();
     let mut analysis_futures = Vec::new();
     for symbol in &config.trade_symbols {
-        let symbol_clone = symbol.clone();
-        let (cached_position, use_cache) = match symbols_cache.get(symbol) {
-            Some(entry) => (
-                entry.position.clone(),
-                entry.should_use_cache(now, config.trade_interval_secs),
-            ),
-            None => (None, false),
-        };
-
-        analysis_futures.push(analyze_symbol(
-            symbol_clone,
-            config,
-            interval_str,
-            use_cache,
-            cached_position,
-        ));
+        analysis_futures.push(analyze_symbol(symbol.clone(), config, interval_str));
     }
 
     let analyses: Vec<SymbolAnalysis> = try_join_all(analysis_futures).await?;
@@ -624,17 +634,12 @@ async fn run_portfolio_cycle(
             Some(a) => a,
             None => {
                 error!("未找到标的 {} 的分析结果，跳过执行", alloc.symbol);
-                symbols_cache.remove(&alloc.symbol);
                 continue;
             }
         };
 
         if alloc.priority == types::AllocationPriority::Skip {
             info!("跳过标的: {} (优先级: Skip)", alloc.symbol);
-            symbols_cache
-                .entry(alloc.symbol.clone())
-                .or_insert_with(SymbolCacheEntry::empty)
-                .update(analysis.position.clone());
             continue;
         }
 
@@ -644,20 +649,12 @@ async fn run_portfolio_cycle(
             Some(c) => *c,
             None => {
                 error!("缺少交易约束，跳过标的 {}", symbol);
-                symbols_cache
-                    .entry(symbol.clone())
-                    .or_insert_with(SymbolCacheEntry::empty)
-                    .update(None);
                 continue;
             }
         };
 
         if allocated_balance <= 0.0 {
             warn!("分配资金为零，跳过标的 {}", symbol);
-            symbols_cache
-                .entry(symbol.clone())
-                .or_insert_with(SymbolCacheEntry::empty)
-                .update(analysis.position.clone());
             continue;
         }
 
@@ -667,10 +664,6 @@ async fn run_portfolio_cycle(
         }
         if max_amount <= 0.0 {
             warn!("最大持仓上限为零，跳过标的 {}", symbol);
-            symbols_cache
-                .entry(symbol.clone())
-                .or_insert_with(SymbolCacheEntry::empty)
-                .update(analysis.position.clone());
             continue;
         }
 
@@ -679,10 +672,6 @@ async fn run_portfolio_cycle(
                 "最小下单量 {:.6} 超过最大允许 {:.6}，跳过标的 {}",
                 constraint.min_qty, max_amount, symbol
             );
-            symbols_cache
-                .entry(symbol.clone())
-                .or_insert_with(SymbolCacheEntry::empty)
-                .update(analysis.position.clone());
             continue;
         }
 
@@ -701,7 +690,6 @@ async fn run_portfolio_cycle(
                 let SymbolCycleResult {
                     traded: cycle_traded,
                     account_snapshot,
-                    position_snapshot,
                     trade_result,
                 } = result;
 
@@ -718,32 +706,11 @@ async fn run_portfolio_cycle(
                         performance_tracker.persist()?;
                     }
                 }
-
-                let cached_position = position_snapshot
-                    .clone()
-                    .or_else(|| analysis.position.clone());
-
-                symbols_cache
-                    .entry(symbol)
-                    .or_insert_with(SymbolCacheEntry::empty)
-                    .update(cached_position);
             }
             Err(e) => {
                 error!("标的 {} 交易周期失败: {:#}", symbol, e);
-                symbols_cache
-                    .entry(symbol)
-                    .or_insert_with(SymbolCacheEntry::empty)
-                    .update(analysis.position.clone());
             }
         }
-    }
-
-    // 对未参与决策的分析结果更新缓存
-    for (symbol, analysis) in analysis_map.into_iter() {
-        symbols_cache
-            .entry(symbol)
-            .or_insert_with(SymbolCacheEntry::empty)
-            .update(analysis.position.clone());
     }
 
     if let Err(err) = risk_guard.persist() {
@@ -882,20 +849,19 @@ async fn run_live() -> Result<()> {
         _ => "1m",
     };
 
-    // 初始化缓存状态
-    let mut symbols_cache: std::collections::HashMap<String, SymbolCacheEntry> =
-        std::collections::HashMap::new();
     let mut performance_tracker = PerformanceTracker::load();
     let mut risk_guard = risk::RiskGuard::load(risk::RiskLimits::from_env());
     let limits = &risk_guard.limits;
     info!(
-        "风控: enabled={} | 止损 {:.2}% | 止盈 {:.2}% | 最大回撤 {:.2}% | 日内亏损 {:.2}% | 熔断平仓={}",
+        "风控: enabled={} | 止损 {:.2}% | 止盈 {:.2}% | 最大回撤 {:.2}% | 日内亏损 {:.2}% | 熔断平仓={} | 交易所条件单={} ({})",
         limits.enabled,
         limits.stop_loss_pct * 100.0,
         limits.take_profit_pct * 100.0,
         limits.max_drawdown_pct * 100.0,
         limits.daily_loss_pct * 100.0,
-        limits.close_on_halt
+        limits.close_on_halt,
+        limits.exchange_stops,
+        limits.trigger_type
     );
     if risk_guard.halted() {
         warn!(
@@ -922,7 +888,6 @@ async fn run_live() -> Result<()> {
             &config,
             interval_str,
             &symbol_constraints,
-            &mut symbols_cache,
             &mut performance_tracker,
             &mut risk_guard,
         )
@@ -933,8 +898,6 @@ async fn run_live() -> Result<()> {
             }
             Err(e) => {
                 error!("投资组合交易周期失败: {:#}", e);
-                // 错误时清空所有缓存
-                symbols_cache.clear();
             }
         }
     }

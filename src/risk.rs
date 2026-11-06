@@ -24,6 +24,10 @@ pub struct RiskLimits {
     pub daily_loss_pct: f64,
     /// 熔断时是否强制平掉已有仓位
     pub close_on_halt: bool,
+    /// 是否在交易所挂 closePosition 条件单（止损/止盈）
+    pub exchange_stops: bool,
+    /// 条件单触发价类型：MARK_PRICE 或 CONTRACT_PRICE
+    pub trigger_type: String,
 }
 
 impl Default for RiskLimits {
@@ -35,6 +39,8 @@ impl Default for RiskLimits {
             max_drawdown_pct: 0.20,
             daily_loss_pct: 0.05,
             close_on_halt: true,
+            exchange_stops: true,
+            trigger_type: "MARK_PRICE".to_string(),
         }
     }
 }
@@ -64,6 +70,11 @@ impl RiskLimits {
             max_drawdown_pct: parse_pct("RISK_MAX_DRAWDOWN_PCT", defaults.max_drawdown_pct),
             daily_loss_pct: parse_pct("RISK_DAILY_LOSS_PCT", defaults.daily_loss_pct),
             close_on_halt: flag("RISK_CLOSE_ON_HALT", defaults.close_on_halt),
+            exchange_stops: flag("RISK_EXCHANGE_STOPS", defaults.exchange_stops),
+            trigger_type: match std::env::var("RISK_TRIGGER_TYPE").as_deref() {
+                Ok("CONTRACT_PRICE") => "CONTRACT_PRICE".to_string(),
+                _ => defaults.trigger_type,
+            },
         }
     }
 }
@@ -380,6 +391,8 @@ mod tests {
                 max_drawdown_pct: 0.20,
                 daily_loss_pct: 0.05,
                 close_on_halt: true,
+                exchange_stops: false,
+                trigger_type: "MARK_PRICE".to_string(),
             },
             state: RiskState::default(),
         }

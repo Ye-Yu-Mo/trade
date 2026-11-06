@@ -2,7 +2,23 @@
 
 所有值得注意的变更都记录在这里。版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased] — v0.3.0
+## [Unreleased] — v0.4.0
+
+### Added
+
+- **交易所条件单**：开仓后在 Binance 挂 `STOP_MARKET` / `TAKE_PROFIT_MARKET`（`closePosition=true`），由交易所在盘中触发，不再只依赖每个周期轮询
+  - 已有且触发价一致时复用，避免每轮撤单重挂
+  - 平仓到空仓后自动清理残留条件单
+  - 条件单失败时本地风控仍然兜底
+  - `RISK_EXCHANGE_STOPS` 控制开关，`RISK_TRIGGER_TYPE` 选择 `MARK_PRICE` / `CONTRACT_PRICE`
+- 纯函数 `protective_prices` 与撤单/挂单接口，含单元测试
+
+### Fixed
+
+- 移除持仓缓存：每轮都从交易所读取真实持仓。原缓存的过期判断实际总是命中，
+  条件单在周期之间触发后，程序仍会拿旧仓位做决策。
+
+## [0.3.0] — 未发布（本地提交）
 
 ### Added
 

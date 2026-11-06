@@ -283,18 +283,19 @@ LLM 基线每根K线调用一次模型，响应缓存在 `.cache/llm/`，同一�
 ### 确定性风控（代码层）
 
 - **止损 / 止盈**：默认分别为开仓名义价值的 2% / 5%。触发时跳过 LLM，直接平仓。
+- **交易所条件单**：有仓位时自动挂 `STOP_MARKET` / `TAKE_PROFIT_MARKET`（`closePosition=true`），由交易所在盘中触发；已有且价格一致则复用。
 - **熔断**：权益从峰值回撤 20%，或当日亏损 5% 时停止开仓；默认同时强制平掉现有仓位。
 - **状态持久化**：写入 `logs/risk_state.json`。日内亏损熔断在 UTC 次日自动解除；回撤熔断需要人工删除该文件后重启。
-- **可配置**：`RISK_ENABLED`、`RISK_STOP_LOSS_PCT`、`RISK_TAKE_PROFIT_PCT`、`RISK_MAX_DRAWDOWN_PCT`、`RISK_DAILY_LOSS_PCT`、`RISK_CLOSE_ON_HALT`。
+- **可配置**：`RISK_ENABLED`、`RISK_STOP_LOSS_PCT`、`RISK_TAKE_PROFIT_PCT`、`RISK_MAX_DRAWDOWN_PCT`、`RISK_DAILY_LOSS_PCT`、`RISK_CLOSE_ON_HALT`、`RISK_EXCHANGE_STOPS`、`RISK_TRIGGER_TYPE`。
 
-实盘每个交易周期检查一次风控；没有挂交易所条件单，极端行情下可能有滑价。
+实盘同时有本地周期检查和交易所条件单两层；条件单下单失败或极端跳空时仍可能滑价。
 
 ## 已知限制
 
 以下问题比功能列表更值得先看：
 
 1. **回测是简化模型。** 不模拟资金费率、保证金强平、盘口冲击和部分成交。盘中止损按K线高低点估算，同一根K线内的真实成交顺序无法还原。
-2. **实盘风控是周期级的。** 默认每 1 分钟检查一次止损止盈，没有交易所条件单兜底。
+2. **条件单不是万能的。** 交易所触发按标记价/最新价以及当时流动性成交，极端行情仍会滑价；条件单下单失败时只剩本地周期检查。
 3. **LLM 决策不确定。** 同一根K线可能给出不同信号。缓存只避免重复付费，不能消除方差，请多跑几次再判断策略。
 4. **不宣称有超额收益。** 同时提供朴素的 SMA 基线和 LLM 基线，就是为了让结果可以被诚实地对照。
 5. **熔断需要人工介入。** 回撤熔断不会自动恢复，必须确认账户状态后删除 `logs/risk_state.json` 再重启。
@@ -366,6 +367,7 @@ src/
 ├── cli.rs           命令行入口（clap）
 ├── backtest.rs      纸面账户、回测引擎、绩效指标
 ├── strategy.rs      可插拔策略：SMA 交叉、LLM 基线
+├── risk.rs          确定性风控：止损止盈、熔断、风控状态
 ├── data.rs          历史K线下载与本地缓存
 ├── llm_client.rs    DeepSeek 客户端、响应缓存、JSON 解析
 ├── multi_agent.rs   分析员 / 策略 / 风控 / 交易员 / 组合协调员

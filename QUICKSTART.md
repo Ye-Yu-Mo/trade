@@ -1,5 +1,17 @@
 # 快速开始
 
+## 0. 一条命令看效果（不需要任何 API key）
+
+```bash
+cargo run --release -- demo
+```
+
+会跑一次内置样本的 SMA 回测并启动 Dashboard。想调试真实的多智能体决策链：
+
+```bash
+cargo run --release -- analyze --symbol BTCUSDT --interval 1h
+```
+
 ## 1. 先跑一次回测（不需要任何 API key）
 
 ```bash

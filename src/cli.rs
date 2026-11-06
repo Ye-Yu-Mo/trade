@@ -3,9 +3,11 @@
 // `trade`（无子命令）保持原有行为：启动实盘/测试网交易循环。
 // `trade backtest` 进入历史回测，不需要 Binance API key。
 
+use crate::analyze;
 use crate::backtest::{self, BacktestConfig};
 use crate::dashboard;
 use crate::data;
+use crate::demo;
 use crate::strategy::Strategy;
 use crate::walkforward::{self, WalkForwardConfig};
 use anyhow::{anyhow, bail, Context, Result};
@@ -37,6 +39,10 @@ pub enum Command {
     Dashboard(DashboardArgs),
     /// Walk-forward 样本外回测，支持多标的
     Walkforward(WalkForwardArgs),
+    /// 对最新K线跑一次多智能体决策链（dry-run，不下单）
+    Analyze(AnalyzeArgs),
+    /// 离线 Demo：无需 API key，一条命令启动带示例数据的 Dashboard
+    Demo(DemoArgs),
 }
 
 #[derive(Debug, Args, Default)]
@@ -142,6 +148,36 @@ pub struct WalkForwardArgs {
     /// 报告输出目录
     #[arg(long, default_value = "backtest")]
     pub out_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct AnalyzeArgs {
+    /// 交易对
+    #[arg(long, default_value = "BTCUSDT")]
+    pub symbol: String,
+
+    /// K线周期
+    #[arg(long, default_value = "1h")]
+    pub interval: String,
+
+    /// 虚拟账户权益（USDT）
+    #[arg(long, default_value_t = 10_000.0)]
+    pub balance: f64,
+
+    /// 单次仓位占权益比例
+    #[arg(long, default_value_t = 0.2)]
+    pub position_pct: f64,
+}
+
+#[derive(Debug, Args)]
+pub struct DemoArgs {
+    /// Dashboard 端口
+    #[arg(long, default_value_t = 8080)]
+    pub port: u16,
+
+    /// 只生成数据，不启动 Dashboard
+    #[arg(long)]
+    pub no_server: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -372,4 +408,26 @@ pub async fn run_walkforward(args: WalkForwardArgs) -> Result<()> {
 
     walkforward::run(config).await?;
     Ok(())
+}
+
+pub async fn run_analyze(args: AnalyzeArgs) -> Result<()> {
+    let api_key =
+        env::var("DEEPSEEK_API_KEY").map_err(|_| anyhow!("analyze 需要设置 DEEPSEEK_API_KEY"))?;
+
+    analyze::run(analyze::AnalyzeConfig {
+        symbol: args.symbol,
+        interval: args.interval,
+        balance: args.balance,
+        position_pct: args.position_pct,
+        api_key,
+    })
+    .await
+}
+
+pub async fn run_demo(args: DemoArgs) -> Result<()> {
+    demo::run(demo::DemoConfig {
+        port: args.port,
+        no_server: args.no_server,
+    })
+    .await
 }

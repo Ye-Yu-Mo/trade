@@ -79,11 +79,13 @@ impl LlmSettings {
     }
 }
 
-/// 调用模型，返回原始文本。相同 (模型, 参数, 提示词) 会命中磁盘缓存。
-pub async fn chat(system_prompt: &str, user_prompt: &str, api_key: &str) -> Result<String> {
-    let settings = LlmSettings::from_env();
-    let key = cache_key(&settings, system_prompt, user_prompt);
-    get_or_fetch(&settings, &key, system_prompt, user_prompt, api_key).await
+#[derive(Debug, Clone, Default)]
+pub struct LlmMeta {
+    pub model: String,
+    pub cached: bool,
+    pub latency_ms: u64,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
 }
 
 /// 调用模型并解析 JSON。解析失败时会作废缓存并重试一次。
@@ -91,13 +93,13 @@ pub async fn chat_json<T: DeserializeOwned>(
     system_prompt: &str,
     user_prompt: &str,
     api_key: &str,
-) -> Result<T> {
+) -> Result<(T, LlmMeta)> {
     let settings = LlmSettings::from_env();
     let key = cache_key(&settings, system_prompt, user_prompt);
     let mut last_error = None;
 
     for attempt in 1..=JSON_PARSE_ATTEMPTS {
-        let content = if attempt == 1 {
+        let (content, meta) = if attempt == 1 {
             get_or_fetch(&settings, &key, system_prompt, user_prompt, api_key).await?
         } else {
             // 缓存里可能是无法解析的旧响应，删掉后重新请求
@@ -106,7 +108,7 @@ pub async fn chat_json<T: DeserializeOwned>(
         };
 
         match parse_json(&content) {
-            Ok(value) => return Ok(value),
+            Ok(value) => return Ok((value, meta)),
             Err(err) => {
                 warn!(
                     "LLM 返回无法解析的 JSON（第 {}/{} 次）: {:#}",
@@ -136,10 +138,17 @@ async fn get_or_fetch(
     system_prompt: &str,
     user_prompt: &str,
     api_key: &str,
-) -> Result<String> {
+) -> Result<(String, LlmMeta)> {
     if let Some(cached) = read_cache(key) {
         debug!("LLM 缓存命中: {}", key);
-        return Ok(cached);
+        return Ok((
+            cached,
+            LlmMeta {
+                model: settings.model.clone(),
+                cached: true,
+                ..Default::default()
+            },
+        ));
     }
     fetch_and_cache(settings, key, system_prompt, user_prompt, api_key).await
 }
@@ -150,12 +159,15 @@ async fn fetch_and_cache(
     system_prompt: &str,
     user_prompt: &str,
     api_key: &str,
-) -> Result<String> {
-    let content = request_with_retry(settings, system_prompt, user_prompt, api_key).await?;
+) -> Result<(String, LlmMeta)> {
+    let (content, mut meta) =
+        request_with_retry(settings, system_prompt, user_prompt, api_key).await?;
+    meta.model = settings.model.clone();
+
     if cache_enabled() {
         write_cache(key, &content);
     }
-    Ok(content)
+    Ok((content, meta))
 }
 
 async fn request_with_retry(
@@ -163,7 +175,7 @@ async fn request_with_retry(
     system_prompt: &str,
     user_prompt: &str,
     api_key: &str,
-) -> Result<String> {
+) -> Result<(String, LlmMeta)> {
     let attempts = settings.retries.saturating_add(1);
     let mut last_error: Option<anyhow::Error> = None;
 
@@ -174,7 +186,7 @@ async fn request_with_retry(
         )
         .await
         {
-            Ok(Ok(content)) => return Ok(content),
+            Ok(Ok(result)) => return Ok(result),
             Ok(Err(err)) => {
                 warn!("LLM 请求失败（第 {}/{} 次）: {:#}", attempt, attempts, err);
                 last_error = Some(err);
@@ -203,7 +215,7 @@ async fn request(
     system_prompt: &str,
     user_prompt: &str,
     api_key: &str,
-) -> Result<String> {
+) -> Result<(String, LlmMeta)> {
     let config = OpenAIConfig::new()
         .with_api_key(api_key)
         .with_api_base(&settings.base_url);
@@ -232,20 +244,42 @@ async fn request(
     }
 
     let request = builder.build()?;
-
+    let started = std::time::Instant::now();
     let response = client
         .chat()
         .create(request)
         .await
         .context("DeepSeek API 调用失败")?;
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    let prompt_tokens = response
+        .usage
+        .as_ref()
+        .map(|usage| usage.prompt_tokens)
+        .unwrap_or(0);
+    let completion_tokens = response
+        .usage
+        .as_ref()
+        .map(|usage| usage.completion_tokens)
+        .unwrap_or(0);
 
     let content = response
         .choices
         .first()
         .and_then(|c| c.message.content.as_ref())
-        .context("DeepSeek 返回为空")?;
+        .context("DeepSeek 返回为空")?
+        .clone();
 
-    Ok(content.clone())
+    Ok((
+        content,
+        LlmMeta {
+            model: settings.model.clone(),
+            cached: false,
+            latency_ms,
+            prompt_tokens,
+            completion_tokens,
+        },
+    ))
 }
 
 fn cache_enabled() -> bool {

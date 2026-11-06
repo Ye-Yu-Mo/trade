@@ -1,9 +1,11 @@
 // 多智能体加密货币自动交易系统
 
+mod analyze;
 mod backtest;
 mod cli;
 mod dashboard;
 mod data;
+mod demo;
 mod executor;
 mod llm_client;
 mod logging;
@@ -218,7 +220,7 @@ async fn analyze_symbol(
 
     // 4. 行情分析
     info!("--- 行情分析员决策 ---");
-    let market_report = multi_agent::market_analyst_analyze(
+    let (market_report, analyst_meta) = multi_agent::market_analyst_analyze(
         &symbol,
         interval_str,
         &klines,
@@ -226,6 +228,13 @@ async fn analyze_symbol(
         &config.deepseek_api_key,
     )
     .await?;
+    state::log_llm_trace(
+        &symbol,
+        "market_analyst",
+        "live",
+        &analyst_meta,
+        &market_report,
+    );
     info!(
         "行情分析员: {:?} ({:?}) | 阶段: {:?} | {}",
         market_report.trend,
@@ -274,6 +283,12 @@ async fn execute_symbol_cycle(
 
     let decision = if let Some(reason) = forced_exit {
         warn!("确定性风控触发，跳过 LLM 决策: {}", reason);
+        state::log_code_trace(
+            &analysis.symbol,
+            "risk_manager",
+            "live",
+            &serde_json::json!({"forced_exit": reason}),
+        );
         types::TradingDecision {
             signal: types::Signal::Close,
             reason,
@@ -284,13 +299,20 @@ async fn execute_symbol_cycle(
         info!("--- 多智能体决策开始 ---");
 
         // 策略研究员
-        let strategy = multi_agent::strategy_researcher_suggest(
+        let (strategy, strategy_meta) = multi_agent::strategy_researcher_suggest(
             &analysis.symbol,
             &analysis.market_report,
             &analysis.position,
             &config.deepseek_api_key,
         )
         .await?;
+        state::log_llm_trace(
+            &analysis.symbol,
+            "strategy_researcher",
+            "live",
+            &strategy_meta,
+            &strategy,
+        );
         info!(
             "策略研究员: {:?} | 时机评分: {}/10 | {}",
             strategy.action, strategy.timing_score, strategy.reasoning
@@ -318,6 +340,7 @@ async fn execute_symbol_cycle(
             atr_percent: analysis.atr_percent,
             constraints,
         });
+        state::log_code_trace(&analysis.symbol, "risk_manager", "live", &risk);
         info!(
             "风险管理员: {:?} | 审批: {:?} | 建议数量: {:.4} | {}",
             risk.risk_level, risk.approval, risk.suggested_amount, risk.reason
@@ -327,7 +350,7 @@ async fn execute_symbol_cycle(
         }
 
         // 决策交易员
-        let mut decision = multi_agent::trade_executor_decide(
+        let (mut decision, executor_meta) = multi_agent::trade_executor_decide(
             &analysis.symbol,
             &analysis.market_report,
             &strategy,
@@ -335,6 +358,13 @@ async fn execute_symbol_cycle(
             &config.deepseek_api_key,
         )
         .await?;
+        state::log_llm_trace(
+            &analysis.symbol,
+            "trade_executor",
+            "live",
+            &executor_meta,
+            &decision,
+        );
         info!(
             "决策交易员: {:?}, 数量: {:.4}, 信心: {:?} | {}",
             decision.signal, decision.amount, decision.confidence, decision.reason
@@ -348,6 +378,7 @@ async fn execute_symbol_cycle(
         decision
     };
 
+    state::log_code_trace(&analysis.symbol, "final_decision", "live", &decision);
     info!(
         "最终决策: {:?}, 数量: {:.4}, 信心: {:?} | {}",
         decision.signal, decision.amount, decision.confidence, decision.reason
@@ -640,13 +671,20 @@ async fn run_portfolio_cycle(
         warn!("写入权益曲线失败: {:#}", err);
     }
 
-    let mut portfolio_allocation = multi_agent::portfolio_coordinator_allocate(
+    let (mut portfolio_allocation, portfolio_meta) = multi_agent::portfolio_coordinator_allocate(
         &symbols_reports,
         total_balance,
         &config.portfolio_mode,
         &config.deepseek_api_key,
     )
     .await?;
+    state::log_llm_trace(
+        "PORTFOLIO",
+        "portfolio_coordinator",
+        "live",
+        &portfolio_meta,
+        &portfolio_allocation,
+    );
 
     let desired_strategy = config.desired_portfolio_strategy();
     if portfolio_allocation.strategy != desired_strategy {
@@ -787,6 +825,8 @@ async fn main() -> Result<()> {
         cli::Command::Backtest(args) => cli::run_backtest(*args).await,
         cli::Command::Dashboard(args) => cli::run_dashboard(args).await,
         cli::Command::Walkforward(args) => cli::run_walkforward(args).await,
+        cli::Command::Analyze(args) => cli::run_analyze(args).await,
+        cli::Command::Demo(args) => cli::run_demo(args).await,
     }
 }
 

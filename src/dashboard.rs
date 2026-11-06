@@ -56,6 +56,7 @@ fn router(config: DashboardConfig) -> Router {
         .route("/api/trades", get(api_trades))
         .route("/api/decisions", get(api_decisions))
         .route("/api/equity", get(api_equity))
+        .route("/api/traces", get(api_traces))
         .route("/api/backtests", get(api_backtests))
         .route("/api/backtest", get(api_backtest))
         .with_state(Arc::new(config))
@@ -126,6 +127,21 @@ async fn api_equity(
             items.reverse(); // 曲线按时间正序
             ok(Value::Array(items))
         }
+        Err(err) => internal_error(err),
+    }
+}
+
+async fn api_traces(
+    State(cfg): State<Arc<DashboardConfig>>,
+    Query(query): Query<LimitQuery>,
+) -> impl IntoResponse {
+    let limit = clamp_limit(query.limit);
+    let path = cfg.logs_dir.join("agent_trace.jsonl");
+    if !path.is_file() {
+        return ok(Value::Array(Vec::new()));
+    }
+    match tail_jsonl(&path, limit) {
+        Ok(items) => ok(Value::Array(items)),
         Err(err) => internal_error(err),
     }
 }

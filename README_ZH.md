@@ -8,6 +8,21 @@
 
 > 这是一个研究与教学框架，**不是**能稳定盈利的交易系统。请先读[已知限制](#已知限制)。
 
+## 60 秒试跑
+
+不需要 API key，不需要联网，不需要配置。
+
+```bash
+cargo run --release -- demo
+```
+
+用仓库自带的 BTCUSDT 1h 样本跑一次 SMA 回测，把结果写进 Dashboard，并启动在 http://127.0.0.1:8080。
+**Agent 决策流**面板会展示一段真实 DeepSeek 运行记录下来的多智能体决策链。
+
+![Dashboard](docs/dashboard.png)
+
+*示例数据与录制回放，非真实收益。*
+
 [English Version](README.md) | [中文版本](README_ZH.md)
 
 ## 核心特性
@@ -22,6 +37,7 @@
 - **历史回测**：确定性 SMA 基线与 LLM 基线，内置手续费和滑点，基线策略无需任何 API key
 - **LLM 可靠性**：JSON 模式、超时重试、按模型区分的响应缓存
 - **低调用量**：每个标的每轮 2 次模型调用（策略 + 交易员），风控由代码完成
+- **Agent 决策链**：每一步记录模型、耗时、token 消耗和完整 JSON 输出，Dashboard 可直接查看
 
 ## 系统架构
 
@@ -232,10 +248,6 @@ cargo run --release -- dashboard --port 8080
 cargo run --release -- run --dashboard 8080
 ```
 
-![Dashboard](docs/dashboard.png)
-
-*示例数据，非真实收益。*
-
 打开 http://127.0.0.1:8080 可以看到：
 
 - 账户权益曲线（`logs/equity.jsonl`，每周期一个点）
@@ -252,6 +264,24 @@ cargo run --release -- run --dashboard 8080
 ```
 
 没有鉴权，**不要把 `--host` 改成 0.0.0.0 暴露到公网**。
+
+## Agent 决策链
+
+`trade analyze` 会跑一次完整决策链，但不下单：
+
+```bash
+cargo run --release -- analyze --symbol BTCUSDT --interval 1h
+```
+
+每一步写入 `logs/agent_trace.jsonl`：
+
+- 阶段：`market_analyst` / `strategy_researcher` / `risk_manager` / `trade_executor`
+- 模型、是否命中缓存、耗时
+- prompt / completion token 数
+- 完整 JSON 输出
+
+Dashboard 会把它渲染成时间线。用它调试 prompt、对比模型，或者看清一个决策到底怎么来的。
+`analyze` 需要 `DEEPSEEK_API_KEY`；`demo` 用的是仓库内录制好的示例，不需要 key。
 
 ## Walk-forward 样本外回测
 
@@ -434,6 +464,8 @@ TRADE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,ADAUSDT
 src/
 ├── main.rs          实盘 / 测试网交易循环与投资组合协调
 ├── cli.rs           命令行入口（clap）
+├── demo.rs          离线零依赖 Demo 与日志生成
+├── analyze.rs       单次多智能体决策链（dry-run）
 ├── dashboard.rs     只读监控服务（axum）
 ├── dashboard.html   Dashboard 单页（无构建步骤）
 ├── backtest.rs      纸面账户、回测引擎、绩效指标
@@ -449,6 +481,9 @@ src/
 ├── state.rs         交易与决策日志
 ├── performance.rs   已实现盈亏与回撤跟踪
 └── logging.rs       日志系统
+examples/
+├── BTCUSDT_1h_sample.json    内置 90 天K线样本
+└── agent_trace.sample.jsonl  录制好的多智能体决策链
 ```
 
 ## 技术栈

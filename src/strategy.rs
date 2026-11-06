@@ -182,8 +182,8 @@ struct LlmDirection {
 impl LlmStrategy {
     async fn decide(&mut self, ctx: &BarContext<'_>) -> Result<Direction> {
         let prompt = build_prompt(ctx)?;
-        let response = llm_client::chat(SYSTEM_PROMPT, &prompt, &self.api_key).await?;
-        let parsed: LlmDirection = llm_client::parse_json(&response)?;
+        let (parsed, _meta): (LlmDirection, _) =
+            llm_client::chat_json(SYSTEM_PROMPT, &prompt, &self.api_key).await?;
 
         Ok(Direction {
             signal: parsed.signal,

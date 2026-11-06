@@ -2,6 +2,21 @@
 
 所有值得注意的变更都记录在这里。版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased] — v0.8.0
+
+### Added
+
+- **离线 Demo**：`trade demo`，无需 API key / 网络
+  - 使用仓库内置的 BTCUSDT 1h 样本跑 SMA 回测
+  - 自动生成 Dashboard 所需的 `status / equity / trades / decisions / performance` 日志
+  - 启动 Dashboard 并展示组合权益、决策、成交和回测结果
+- **Agent 决策链追踪**
+  - 每个智能体阶段写入 `logs/agent_trace.jsonl`：阶段、模型、缓存命中、耗时、prompt/completion tokens、完整输出
+  - Dashboard 新增「Agent 决策流」面板，可展开查看每一步 JSON
+  - `trade analyze --symbol BTCUSDT`：dry-run 跑完整决策链，不下单，用于调试 prompt 和生成 trace
+  - 仓库内置 `examples/agent_trace.sample.jsonl`（真实 DeepSeek 运行录制）
+- LLM 客户端返回 `LlmMeta`（耗时 / token），所有智能体调用都会记录
+
 ## [Unreleased] — v0.7.0
 
 ### Added

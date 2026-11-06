@@ -8,6 +8,22 @@ A multi-agent collaborative portfolio trading bot built with Rust, using DeepSee
 
 > This is a research and education framework, **not** a profitable trading system. See [Known Limitations](#known-limitations).
 
+## Try it in 60 seconds
+
+No API keys. No network. No configuration.
+
+```bash
+cargo run --release -- demo
+```
+
+This runs a deterministic SMA backtest on a bundled BTCUSDT 1h sample, seeds the dashboard, and
+serves it at http://127.0.0.1:8080. The **Agent 决策流** panel shows a recorded multi-agent decision
+chain from a real DeepSeek run.
+
+![Dashboard](docs/dashboard.png)
+
+*Sample data from the bundled demo and a recorded agent trace, not real performance.*
+
 [English Version](README.md) | [中文版本](README_ZH.md)
 
 ## Core Features
@@ -22,6 +38,7 @@ A multi-agent collaborative portfolio trading bot built with Rust, using DeepSee
 - **Backtesting**: deterministic SMA baseline and an LLM baseline, with fees and slippage. No API key required for the baseline.
 - **LLM Reliability**: JSON mode, request timeouts, retries, and a model-aware response cache
 - **Low Call Volume**: 2 model calls per symbol per cycle (strategy + executor); risk is enforced in code
+- **Agent Trace**: every stage records model, latency, token usage and full JSON output; visible in the dashboard
 
 ## System Architecture
 
@@ -232,10 +249,6 @@ cargo run --release -- dashboard --port 8080
 cargo run --release -- run --dashboard 8080
 ```
 
-![Dashboard](docs/dashboard.png)
-
-*Sample data from a local fixture, not real performance.*
-
 Open http://127.0.0.1:8080 to see:
 
 - Account equity curve (`logs/equity.jsonl`, one point per cycle)
@@ -252,6 +265,25 @@ All endpoints are read-only GETs:
 ```
 
 There is no authentication. **Do not bind it to `0.0.0.0` on a public network.**
+
+## Agent Trace
+
+`trade analyze` runs one complete decision chain without placing orders:
+
+```bash
+cargo run --release -- analyze --symbol BTCUSDT --interval 1h
+```
+
+It records every stage to `logs/agent_trace.jsonl`:
+
+- stage (`market_analyst` / `strategy_researcher` / `risk_manager` / `trade_executor`)
+- model, cached vs live, latency
+- prompt and completion tokens
+- the full JSON output
+
+The dashboard renders this as a timeline. Use it to debug prompts, compare models, or see exactly
+where a decision came from. `analyze` needs `DEEPSEEK_API_KEY`; the `demo` command uses a recorded
+sample instead.
 
 ## Walk-Forward Backtesting
 
@@ -450,6 +482,8 @@ TRADE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,ADAUSDT
 src/
 ├── main.rs          Live / testnet trading loop and portfolio coordination
 ├── cli.rs           Command line interface (clap)
+├── demo.rs          Offline, zero-key demo and log seeding
+├── analyze.rs       Dry-run multi-agent decision chain
 ├── dashboard.rs     Read-only monitoring server (axum)
 ├── dashboard.html   Single-page dashboard (no build step)
 ├── backtest.rs      Paper broker, backtest engine, metrics

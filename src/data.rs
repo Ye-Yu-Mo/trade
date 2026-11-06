@@ -144,6 +144,18 @@ pub fn interval_millis(interval: &str) -> Option<i64> {
     Some(n * unit_ms)
 }
 
+/// 从本地 JSON 文件读取K线数组（示例数据 / 离线回测）。
+pub fn load_kline_file(path: &Path) -> Result<Vec<Kline>> {
+    let text =
+        fs::read_to_string(path).with_context(|| format!("读取K线文件失败: {}", path.display()))?;
+    let klines: Vec<Kline> = serde_json::from_str(&text)
+        .with_context(|| format!("解析K线文件失败: {}", path.display()))?;
+    if klines.is_empty() {
+        bail!("K线文件为空: {}", path.display());
+    }
+    Ok(klines)
+}
+
 /// 解析用户输入的时间。支持：
 /// - `2025-01-01`
 /// - `2025-01-01 12:30`
@@ -206,6 +218,14 @@ mod tests {
         let b = cache_path(Path::new("data"), "BTCUSDT", "1h", 1, 2);
         assert_eq!(a, b);
         assert!(a.to_string_lossy().contains("BTCUSDT_1h_1_2.json"));
+    }
+
+    #[test]
+    fn bundled_kline_sample_is_valid() {
+        let text = include_str!("../examples/BTCUSDT_1h_sample.json");
+        let klines: Vec<Kline> = serde_json::from_str(text).unwrap();
+        assert!(klines.len() > 2_000);
+        assert!(klines.iter().all(|k| k.close > 0.0));
     }
 
     #[test]

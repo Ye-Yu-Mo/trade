@@ -1,6 +1,6 @@
 // 多智能体交易决策系统
 
-use crate::llm_client;
+use crate::llm_client::{self, LlmMeta};
 use crate::types::*;
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -245,7 +245,7 @@ pub async fn market_analyst_analyze(
     klines: &[Kline],
     indicators: &TechnicalIndicators,
     api_key: &str,
-) -> Result<MarketReport> {
+) -> Result<(MarketReport, LlmMeta)> {
     let prompt = build_market_analyst_prompt(symbol, interval, klines, indicators)?;
     llm_client::chat_json(get_market_analyst_system_prompt(), &prompt, api_key).await
 }
@@ -386,7 +386,7 @@ pub async fn strategy_researcher_suggest(
     market_report: &MarketReport,
     position: &Option<Position>,
     api_key: &str,
-) -> Result<StrategyAdvice> {
+) -> Result<(StrategyAdvice, LlmMeta)> {
     let prompt = build_strategy_researcher_prompt(symbol, market_report, position)?;
     llm_client::chat_json(get_strategy_researcher_system_prompt(), &prompt, api_key).await
 }
@@ -536,7 +536,7 @@ pub async fn trade_executor_decide(
     strategy: &StrategyAdvice,
     risk: &RiskAssessment,
     api_key: &str,
-) -> Result<TradingDecision> {
+) -> Result<(TradingDecision, LlmMeta)> {
     let prompt = build_trade_executor_prompt(symbol, market_report, strategy, risk)?;
     llm_client::chat_json(get_trade_executor_system_prompt(), &prompt, api_key).await
 }
@@ -684,7 +684,7 @@ pub async fn portfolio_coordinator_allocate(
     total_balance: f64,
     portfolio_strategy: &str,
     api_key: &str,
-) -> Result<PortfolioAllocation> {
+) -> Result<(PortfolioAllocation, LlmMeta)> {
     let prompt =
         build_portfolio_coordinator_prompt(total_balance, portfolio_strategy, symbols_reports)?;
     llm_client::chat_json(get_portfolio_coordinator_system_prompt(), &prompt, api_key).await

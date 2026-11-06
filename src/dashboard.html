@@ -94,6 +94,34 @@
   dt { color: var(--muted); }
   dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
   footer { color: var(--muted); font-size: 11px; text-align: center; margin-top: 24px; }
+  .trace {
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--muted);
+    border-radius: 10px;
+    background: var(--panel-2);
+    padding: 10px 12px;
+    margin-bottom: 10px;
+  }
+  .trace.market_analyst { border-left-color: var(--accent); }
+  .trace.strategy_researcher { border-left-color: var(--yellow); }
+  .trace.risk_manager { border-left-color: var(--red); }
+  .trace.trade_executor { border-left-color: var(--green); }
+  .trace.final_decision { border-left-color: var(--muted); }
+  .trace.portfolio_coordinator { border-left-color: #a371f7; }
+  .trace-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; font-size: 11px; }
+  .trace details { margin-top: 8px; }
+  .trace summary { cursor: pointer; color: var(--muted); font-size: 11px; }
+  pre.json {
+    margin: 8px 0 0;
+    padding: 10px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    overflow-x: auto;
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--text);
+  }
 </style>
 </head>
 <body>
@@ -139,6 +167,14 @@
         <div id="trades"></div>
       </section>
     </div>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Agent 决策流</h2>
+        <span class="hint">agent_trace.jsonl · 最新 30 条</span>
+      </div>
+      <div id="traces"></div>
+    </section>
 
     <section class="panel">
       <div class="panel-head">
@@ -395,6 +431,62 @@ function renderEquity(points) {
   drawChart($("#liveChart"), state.liveEquity, "equity");
 }
 
+const STAGE_LABELS = {
+  market_analyst: "行情分析",
+  strategy_researcher: "策略研究",
+  risk_manager: "风控",
+  trade_executor: "决策交易",
+  final_decision: "最终决策",
+  portfolio_coordinator: "组合分配",
+};
+
+function stageClass(stage) {
+  return STAGE_LABELS[stage] ? stage : "hold";
+}
+
+function latencyText(ms) {
+  if (!ms) return "0 ms";
+  return ms >= 1000 ? (ms / 1000).toFixed(1) + " s" : ms + " ms";
+}
+
+function tokenText(t) {
+  const n = Number(t || 0);
+  if (!n) return "0 tokens";
+  return n >= 1000 ? (n / 1000).toFixed(1) + "k tokens" : n + " tokens";
+}
+
+function renderTraces(items) {
+  const box = $("#traces");
+  if (!items || !items.length) {
+    box.replaceChildren(el("div", { class: "empty", text: "暂无 Agent 记录。运行 cargo run --release -- analyze --symbol BTCUSDT" }));
+    return;
+  }
+
+  box.replaceChildren(...items.map((t) => {
+    const stage = t.stage || "";
+    const label = STAGE_LABELS[stage] || stage;
+    const tokens = Number(t.prompt_tokens || 0) + Number(t.completion_tokens || 0);
+
+    const head = el("div", { class: "trace-head" },
+      el("span", { class: "mono", text: timeText(t.timestamp) }),
+      el("span", { class: "badge " + stageClass(stage), text: label, title: stage }),
+      el("span", { class: "muted", text: t.symbol || "" }),
+      el("span", { class: "muted", text: t.cached ? "缓存" : (t.model || "") }),
+      el("span", { class: "muted", text: latencyText(t.latency_ms) }),
+      el("span", { class: "muted", text: tokenText(tokens) }),
+      t.source && t.source !== "live" ? el("span", { class: "badge hold", text: "示例记录" }) : null
+    );
+
+    return el("div", { class: "trace " + stageClass(stage) },
+      head,
+      el("details", {},
+        el("summary", { text: "查看输出" }),
+        el("pre", { class: "json", text: JSON.stringify(t.output, null, 2) })
+      )
+    );
+  }));
+}
+
 function renderDecisions(items) {
   const rows = (items || []).map(d => el("tr", {},
     el("td", { class: "mono", text: timeText(d.timestamp) }),
@@ -454,15 +546,16 @@ async function loadBacktest(file) {
 
 async function refresh() {
   try {
-    const [status, perf, equity, trades, decisions] = await Promise.all([
+    const [status, perf, equity, trades, decisions, traces] = await Promise.all([
       api("/api/status"), api("/api/performance"), api("/api/equity?limit=1000"),
-      api("/api/trades?limit=15"), api("/api/decisions?limit=15"),
+      api("/api/trades?limit=15"), api("/api/decisions?limit=15"), api("/api/traces?limit=30"),
     ]);
     renderLiveCards(status, perf);
     renderRisk(status);
     renderEquity(equity);
     renderTrades(trades);
     renderDecisions(decisions);
+    renderTraces(traces);
 
     $("#dot").className = "dot on";
     $("#updated").textContent = status.updated_at_text

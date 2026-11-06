@@ -112,6 +112,10 @@ impl RiskGuard {
         self.limits.enabled && self.state.halt.is_some()
     }
 
+    pub fn state(&self) -> &RiskState {
+        &self.state
+    }
+
     pub fn halt_reason(&self) -> Option<&str> {
         self.state.halt_reason.as_deref()
     }

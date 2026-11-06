@@ -52,6 +52,11 @@ cargo run --release -- backtest --strategy llm --max-bars 200
 # 查看全部回测参数
 cargo run --release -- backtest --help
 
+# 启动只读 Dashboard（另开一个终端）
+cargo run --release -- dashboard --port 8080
+# 或随交易循环一起启动
+cargo run --release -- run --dashboard 8080
+
 # 跳过手续费/滑点做敏感性对比（不建议用于结论）
 cargo run --release -- backtest --fee-bps 0 --slippage-bps 0
 

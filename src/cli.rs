@@ -4,6 +4,7 @@
 // `trade backtest` 进入历史回测，不需要 Binance API key。
 
 use crate::backtest::{self, BacktestConfig};
+use crate::dashboard;
 use crate::data;
 use crate::strategy::Strategy;
 use anyhow::{anyhow, bail, Result};
@@ -28,9 +29,41 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// 启动实盘 / 测试网交易循环（默认行为）
-    Run,
+    Run(RunArgs),
     /// 用历史数据回测策略
     Backtest(Box<BacktestArgs>),
+    /// 启动只读 Dashboard（读取 logs/ 与 backtest/）
+    Dashboard(DashboardArgs),
+}
+
+#[derive(Debug, Args, Default)]
+pub struct RunArgs {
+    /// 同时启动只读 Dashboard 的端口（默认不启动）
+    #[arg(long)]
+    pub dashboard: Option<u16>,
+
+    /// Dashboard 绑定地址
+    #[arg(long, default_value = "127.0.0.1")]
+    pub dashboard_host: String,
+}
+
+#[derive(Debug, Args)]
+pub struct DashboardArgs {
+    /// 绑定地址。只读服务，默认只监听本机
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+
+    /// 端口
+    #[arg(long, default_value_t = 8080)]
+    pub port: u16,
+
+    /// 日志目录
+    #[arg(long, default_value = "logs")]
+    pub logs_dir: PathBuf,
+
+    /// 回测结果目录
+    #[arg(long, default_value = "backtest")]
+    pub backtest_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -173,4 +206,16 @@ pub async fn run_backtest(args: BacktestArgs) -> Result<()> {
 
     backtest::run(config, strategy).await?;
     Ok(())
+}
+
+pub async fn run_dashboard(args: DashboardArgs) -> Result<()> {
+    dashboard::serve(
+        &args.host,
+        args.port,
+        dashboard::DashboardConfig {
+            logs_dir: args.logs_dir,
+            backtest_dir: args.backtest_dir,
+        },
+    )
+    .await
 }

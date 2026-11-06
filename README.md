@@ -219,6 +219,39 @@ runs over the same range are free. Start with `--max-bars` to control cost.
 
 Run `cargo run -- backtest --help` for the full list.
 
+## Dashboard
+
+A read-only monitoring UI. It never trades and binds to localhost by default:
+
+```bash
+# Standalone, reading logs/ and backtest/
+cargo run --release -- dashboard --port 8080
+
+# Or start it together with the trading loop
+cargo run --release -- run --dashboard 8080
+```
+
+![Dashboard](docs/dashboard.png)
+
+*Sample data from a local fixture, not real performance.*
+
+Open http://127.0.0.1:8080 to see:
+
+- Account equity curve (`logs/equity.jsonl`, one point per cycle)
+- Current positions, risk state and halt reason
+- Recent decisions and fills
+- Backtest browser: return, drawdown, Sharpe, win rate and equity curve
+
+All endpoints are read-only GETs:
+
+```
+/api/status  /api/performance  /api/risk
+/api/trades  /api/decisions    /api/equity
+/api/backtests  /api/backtest?file=...
+```
+
+There is no authentication. **Do not bind it to `0.0.0.0` on a public network.**
+
 ## Multi-Agent Decision Process
 
 ### Phase 1: Parallel Market Analysis
@@ -377,6 +410,8 @@ TRADE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,ADAUSDT
 src/
 ├── main.rs          Live / testnet trading loop and portfolio coordination
 ├── cli.rs           Command line interface (clap)
+├── dashboard.rs     Read-only monitoring server (axum)
+├── dashboard.html   Single-page dashboard (no build step)
 ├── backtest.rs      Paper broker, backtest engine, metrics
 ├── strategy.rs      Pluggable strategies: SMA cross, LLM baseline
 ├── risk.rs          Deterministic stops, circuit breakers, risk state

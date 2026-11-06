@@ -1,0 +1,488 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trade Dashboard</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0e14;
+    --panel: #111722;
+    --panel-2: #0e131d;
+    --line: #1e2735;
+    --text: #e7ebf2;
+    --muted: #8a94a6;
+    --accent: #5b8cff;
+    --green: #3fb950;
+    --red: #f85149;
+    --yellow: #d29922;
+    --radius: 14px;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f9;
+      --panel: #ffffff;
+      --panel-2: #f8fafc;
+      --line: #e3e8ef;
+      --text: #0f172a;
+      --muted: #64748b;
+      --accent: #2563eb;
+      --green: #15803d;
+      --red: #dc2626;
+      --yellow: #a16207;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 24px 20px 64px; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+  .brand { font-weight: 700; letter-spacing: .08em; font-size: 15px; }
+  .brand span { color: var(--muted); font-weight: 400; letter-spacing: 0; margin-left: 8px; }
+  .meta { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; color: var(--muted); font-size: 12px; min-width: 0; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.on { background: var(--green); box-shadow: 0 0 0 4px color-mix(in srgb, var(--green) 18%, transparent); }
+  .dot.off { background: var(--red); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; }
+  .card .label { color: var(--muted); font-size: 12px; }
+  .card .value { font-size: 22px; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .card .sub { color: var(--muted); font-size: 11px; margin-top: 2px; min-height: 14px; }
+  .pos { color: var(--green); }
+  .neg { color: var(--red); }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; margin-bottom: 16px; min-width: 0; }
+  .panel-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+  .panel h2 { font-size: 14px; margin: 0; font-weight: 600; }
+  .hint { color: var(--muted); font-size: 11px; }
+  .grid2 { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 16px; }
+  .grid2 > * { min-width: 0; }
+  @media (max-width: 860px) {
+    .grid2 { grid-template-columns: minmax(0, 1fr); }
+    .wrap { padding: 18px 14px 48px; }
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; color: var(--muted); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  td { padding: 7px 8px; border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .muted { color: var(--muted); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; border: 1px solid transparent; white-space: nowrap; }
+  .badge.buy { color: var(--green); background: color-mix(in srgb, var(--green) 12%, transparent); border-color: color-mix(in srgb, var(--green) 35%, transparent); }
+  .badge.sell { color: var(--red); background: color-mix(in srgb, var(--red) 12%, transparent); border-color: color-mix(in srgb, var(--red) 35%, transparent); }
+  .badge.close { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
+  .badge.hold { color: var(--muted); background: color-mix(in srgb, var(--muted) 12%, transparent); border-color: color-mix(in srgb, var(--muted) 30%, transparent); }
+  .badge.warn { color: var(--yellow); background: color-mix(in srgb, var(--yellow) 12%, transparent); border-color: color-mix(in srgb, var(--yellow) 35%, transparent); }
+  .badge.ok { color: var(--green); background: color-mix(in srgb, var(--green) 12%, transparent); border-color: color-mix(in srgb, var(--green) 35%, transparent); }
+  canvas { display: block; width: 100%; }
+  #positions, #decisions, #trades { overflow-x: auto; scrollbar-width: thin; }
+  #positions table { min-width: 430px; }
+  #decisions table { min-width: 560px; }
+  #trades table { min-width: 460px; }
+  #decisions td:nth-child(4) { min-width: 210px; }
+  .empty { color: var(--muted); text-align: center; padding: 26px 0; font-size: 12px; }
+  select {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 10px; font-size: 12px; max-width: 100%; min-width: 0;
+  }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; margin: 0; font-size: 12px; }
+  dt { color: var(--muted); }
+  dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+  footer { color: var(--muted); font-size: 11px; text-align: center; margin-top: 24px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">TRADE <span>多智能体交易监控</span></div>
+    <div class="meta">
+      <span id="dot" class="dot"></span>
+      <span id="updated">等待数据…</span>
+      <span id="riskBadge" class="badge hold">风控 —</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="cards" id="liveCards"></section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>账户权益</h2>
+        <span class="hint">logs/equity.jsonl · 每周期一个点</span>
+      </div>
+      <canvas id="liveChart" height="220"></canvas>
+    </section>
+
+    <div class="grid2">
+      <section class="panel">
+        <div class="panel-head"><h2>当前持仓</h2></div>
+        <div id="positions"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>风控状态</h2></div>
+        <dl id="riskPanel"></dl>
+      </section>
+    </div>
+
+    <div class="grid2">
+      <section class="panel">
+        <div class="panel-head"><h2>最近决策</h2><span class="hint">decisions.jsonl</span></div>
+        <div id="decisions"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>最近成交</h2><span class="hint">trades.jsonl</span></div>
+        <div id="trades"></div>
+      </section>
+    </div>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>回测</h2>
+        <select id="backtestSelect"><option value="">加载中…</option></select>
+      </div>
+      <section class="cards" id="btCards"></section>
+      <canvas id="btChart" height="220"></canvas>
+    </section>
+  </main>
+
+  <footer>只读视图 · 默认绑定 127.0.0.1 · 数据来自 logs/ 与 backtest/</footer>
+</div>
+
+<script>
+const state = { liveEquity: [], bt: null };
+const $ = (sel) => document.querySelector(sel);
+
+async function api(path) {
+  const res = await fetch(path, { cache: "no-store" });
+  if (!res.ok) throw new Error(path + " " + res.status);
+  return res.json();
+}
+
+function fmt(n, d = 2) {
+  if (n === null || n === undefined || n === "" || Number.isNaN(Number(n))) return "—";
+  return Number(n).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+
+function pct(n, d = 2) {
+  if (n === null || n === undefined || Number.isNaN(Number(n))) return "—";
+  const v = Number(n);
+  return (v > 0 ? "+" : "") + v.toFixed(d) + "%";
+}
+
+function signClass(n) {
+  const v = Number(n);
+  return v > 0 ? "pos" : v < 0 ? "neg" : "";
+}
+
+function timeText(ts) {
+  if (!ts) return "—";
+  const ms = Math.abs(ts) < 1e12 ? ts * 1000 : ts;
+  const d = new Date(ms);
+  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString();
+}
+
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (value === null || value === undefined) continue;
+    if (key === "class") node.className = value;
+    else if (key === "text") node.textContent = value;
+    else node.setAttribute(key, value);
+  }
+  for (const child of children) {
+    if (child === null || child === undefined) continue;
+    node.append(child.nodeType ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function renderCards(container, items) {
+  container.replaceChildren(...items.map(([label, value, sub, klass]) =>
+    el("div", { class: "card" },
+      el("div", { class: "label", text: label }),
+      el("div", { class: "value " + (klass || ""), text: value }),
+      el("div", { class: "sub", text: sub || "" })
+    )
+  ));
+}
+
+function renderTable(container, headers, rows, emptyText) {
+  if (!rows.length) {
+    container.replaceChildren(el("div", { class: "empty", text: emptyText }));
+    return;
+  }
+  const thead = el("thead", {}, el("tr", {}, ...headers.map(h => el("th", { text: h }))));
+  const tbody = el("tbody", {}, ...rows);
+  container.replaceChildren(el("table", {}, thead, tbody));
+}
+
+function badge(text, klass) {
+  return el("span", { class: "badge " + klass, text });
+}
+
+function signalClass(signal) {
+  if (signal === "BUY") return "buy";
+  if (signal === "SELL") return "sell";
+  if (signal === "CLOSE") return "close";
+  return "hold";
+}
+
+function actionClass(action) {
+  if (action === "OpenLong") return "buy";
+  if (action === "OpenShort") return "sell";
+  if (action === "CloseLong" || action === "CloseShort") return "close";
+  return "hold";
+}
+
+function drawChart(canvas, points, valueKey) {
+  const dpr = window.devicePixelRatio || 1;
+  const cssH = 220;
+  const width = canvas.clientWidth || 600;
+  canvas.width = Math.floor(width * dpr);
+  canvas.height = Math.floor(cssH * dpr);
+  canvas.style.height = cssH + "px";
+
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, cssH);
+
+  const values = points.map(p => Number(p[valueKey] ?? p.equity ?? p.value ?? 0)).filter(Number.isFinite);
+  if (values.length < 2) {
+    ctx.fillStyle = cssVar("--muted");
+    ctx.font = "12px -apple-system, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("暂无数据", width / 2, cssH / 2);
+    return;
+  }
+
+  const pad = { l: 62, r: 12, t: 14, b: 24 };
+  const plotW = width - pad.l - pad.r;
+  const plotH = cssH - pad.t - pad.b;
+  let min = Math.min(...values);
+  let max = Math.max(...values);
+  if (min === max) { min -= 1; max += 1; }
+  const span = max - min;
+  const x = (i) => pad.l + plotW * i / (values.length - 1);
+  const y = (v) => pad.t + plotH * (1 - (v - min) / span);
+
+  ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+  ctx.fillStyle = cssVar("--muted");
+  ctx.strokeStyle = cssVar("--line");
+  ctx.lineWidth = 1;
+
+  for (let i = 0; i <= 4; i++) {
+    const yy = pad.t + plotH * i / 4;
+    ctx.beginPath();
+    ctx.moveTo(pad.l, yy);
+    ctx.lineTo(width - pad.r, yy);
+    ctx.stroke();
+    ctx.fillText(fmt(max - span * i / 4, 2), 6, yy + 3);
+  }
+
+  const accent = cssVar("--accent");
+  const grad = ctx.createLinearGradient(0, pad.t, 0, cssH - pad.b);
+  grad.addColorStop(0, "rgba(91,140,255,0.26)");
+  grad.addColorStop(1, "rgba(91,140,255,0)");
+
+  ctx.beginPath();
+  values.forEach((v, i) => i === 0 ? ctx.moveTo(x(i), y(v)) : ctx.lineTo(x(i), y(v)));
+  ctx.lineTo(x(values.length - 1), cssH - pad.b);
+  ctx.lineTo(x(0), cssH - pad.b);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  ctx.beginPath();
+  values.forEach((v, i) => i === 0 ? ctx.moveTo(x(i), y(v)) : ctx.lineTo(x(i), y(v)));
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  const lastX = x(values.length - 1);
+  const lastY = y(values[values.length - 1]);
+  ctx.beginPath();
+  ctx.arc(lastX, lastY, 3.5, 0, Math.PI * 2);
+  ctx.fillStyle = accent;
+  ctx.fill();
+
+  if (points.length > 1) {
+    const axis = (ts) => {
+      if (width >= 560) return timeText(ts);
+      const raw = ts ? (Math.abs(ts) < 1e12 ? ts * 1000 : ts) : 0;
+      const d = new Date(raw);
+      if (Number.isNaN(d.getTime())) return "—";
+      const pad = (n) => String(n).padStart(2, "0");
+      return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    };
+    ctx.fillStyle = cssVar("--muted");
+    ctx.textAlign = "left";
+    ctx.fillText(axis(points[0].timestamp ?? points[0].time), pad.l, cssH - 6);
+    ctx.textAlign = "right";
+    ctx.fillText(axis(points[points.length - 1].timestamp ?? points[points.length - 1].time), width - pad.r, cssH - 6);
+  }
+}
+
+function renderLiveCards(status, perf) {
+  const account = (status && status.account) || {};
+  const p = perf || {};
+  const wins = Number(p.winning_trades || 0);
+  const losses = Number(p.losing_trades || 0);
+  const total = wins + losses;
+
+  renderCards($("#liveCards"), [
+    ["总权益", fmt(account.total_wallet_balance), "USDT", ""],
+    ["可用余额", fmt(account.available_balance), "USDT", ""],
+    ["已实现盈亏", fmt(p.total_realized_pnl), "USDT", signClass(p.total_realized_pnl)],
+    ["交易笔数", fmt(p.total_trades, 0), `${wins} 胜 / ${losses} 负`, ""],
+    ["胜率", total ? ((wins / total) * 100).toFixed(1) + "%" : "—", "", ""],
+    ["最大回撤", fmt(p.max_drawdown), "USDT", ""],
+  ]);
+}
+
+function renderRisk(status) {
+  const risk = (status && status.risk) || {};
+  const badgeEl = $("#riskBadge");
+  if (risk.halted) {
+    badgeEl.className = "badge warn";
+    badgeEl.textContent = "风控 熔断";
+  } else if (status && status.updated_at) {
+    badgeEl.className = "badge ok";
+    badgeEl.textContent = "风控 正常";
+  } else {
+    badgeEl.className = "badge hold";
+    badgeEl.textContent = "风控 —";
+  }
+
+  const rows = [
+    ["状态", risk.halted ? "熔断" : status && status.updated_at ? "正常" : "无数据"],
+    ["原因", risk.halt_reason || "—"],
+    ["峰值权益", fmt(risk.peak_equity)],
+    ["当前权益", fmt(risk.last_equity)],
+    ["止损", risk.stop_loss_pct ? (Number(risk.stop_loss_pct) * 100).toFixed(2) + "%" : "—"],
+    ["止盈", risk.take_profit_pct ? (Number(risk.take_profit_pct) * 100).toFixed(2) + "%" : "—"],
+  ];
+  $("#riskPanel").replaceChildren(...rows.flatMap(([k, v]) => [
+    el("dt", { text: k }),
+    el("dd", { text: v }),
+  ]));
+
+  const positions = Array.isArray(status && status.positions) ? status.positions : [];
+  renderTable(
+    $("#positions"),
+    ["标的", "方向", "数量", "开仓价", "浮盈亏"],
+    positions.map(p => el("tr", {},
+      el("td", { text: p.symbol || "" }),
+      el("td", {}, badge(p.side || "—", p.side === "Long" ? "buy" : p.side === "Short" ? "sell" : "hold")),
+      el("td", { text: fmt(p.amount, 6) }),
+      el("td", { text: fmt(p.entry_price, 2) }),
+      el("td", { class: signClass(p.unrealized_pnl), text: fmt(p.unrealized_pnl) })
+    )),
+    "当前空仓"
+  );
+}
+
+function renderEquity(points) {
+  state.liveEquity = Array.isArray(points) ? points : [];
+  drawChart($("#liveChart"), state.liveEquity, "equity");
+}
+
+function renderDecisions(items) {
+  const rows = (items || []).map(d => el("tr", {},
+    el("td", { class: "mono", text: timeText(d.timestamp) }),
+    el("td", { text: d.symbol || "" }),
+    el("td", {}, badge(d.decision?.signal || "—", signalClass(d.decision?.signal))),
+    el("td", { class: "muted", text: d.decision?.reason || "" })
+  ));
+  renderTable($("#decisions"), ["时间", "标的", "信号", "理由"], rows, "暂无决策");
+}
+
+function renderTrades(items) {
+  const rows = (items || []).map(t => el("tr", {},
+    el("td", { class: "mono", text: timeText(t.timestamp) }),
+    el("td", { text: t.symbol || "" }),
+    el("td", {}, badge(t.action || "—", actionClass(t.action))),
+    el("td", { text: fmt(t.price, 2) }),
+    el("td", { class: signClass(t.pnl), text: t.pnl === null || t.pnl === undefined ? "—" : fmt(t.pnl) })
+  ));
+  renderTable($("#trades"), ["时间", "标的", "动作", "价格", "盈亏"], rows, "暂无成交");
+}
+
+async function loadBacktests() {
+  const select = $("#backtestSelect");
+  try {
+    const list = await api("/api/backtests");
+    if (!Array.isArray(list) || !list.length) {
+      select.replaceChildren(el("option", { value: "", text: "暂无回测结果" }));
+      return;
+    }
+    select.replaceChildren(...list.map(item => el("option", {
+      value: item.file,
+      text: `${item.symbol} · ${item.interval} · ${item.strategy} · ${timeText(item.end_ms)}`,
+    })));
+    await loadBacktest(list[0].file);
+  } catch (err) {
+    select.replaceChildren(el("option", { value: "", text: "读取失败" }));
+  }
+}
+
+async function loadBacktest(file) {
+  if (!file) return;
+  try {
+    const data = await api("/api/backtest?file=" + encodeURIComponent(file));
+    state.bt = data;
+    const m = data.metrics || {};
+    renderCards($("#btCards"), [
+      ["策略收益", pct(m.total_return_pct), `买入持有 ${pct(m.buy_and_hold_return_pct)}`, signClass(m.total_return_pct)],
+      ["最大回撤", fmt(m.max_drawdown_pct) + "%", "Sharpe " + fmt(m.sharpe)],
+      ["交易次数", fmt(m.trade_count, 0), `胜率 ${fmt(m.win_rate_pct, 1)}%`],
+      ["累计手续费", fmt(m.total_fees), "USDT"],
+    ]);
+    drawChart($("#btChart"), Array.isArray(data.equity_curve) ? data.equity_curve : [], "equity");
+  } catch (err) {
+    $("#btCards").replaceChildren(el("div", { class: "empty", text: "回测读取失败" }));
+  }
+}
+
+async function refresh() {
+  try {
+    const [status, perf, equity, trades, decisions] = await Promise.all([
+      api("/api/status"), api("/api/performance"), api("/api/equity?limit=1000"),
+      api("/api/trades?limit=15"), api("/api/decisions?limit=15"),
+    ]);
+    renderLiveCards(status, perf);
+    renderRisk(status);
+    renderEquity(equity);
+    renderTrades(trades);
+    renderDecisions(decisions);
+
+    $("#dot").className = "dot on";
+    $("#updated").textContent = status.updated_at_text
+      ? "更新于 " + status.updated_at_text
+      : "等待交易循环写入状态…";
+  } catch (err) {
+    $("#dot").className = "dot off";
+    $("#updated").textContent = "连接失败";
+  }
+}
+
+$("#backtestSelect").addEventListener("change", (event) => loadBacktest(event.target.value));
+window.addEventListener("resize", () => {
+  drawChart($("#liveChart"), state.liveEquity, "equity");
+  if (state.bt) drawChart($("#btChart"), state.bt.equity_curve || [], "equity");
+});
+
+refresh();
+loadBacktests();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

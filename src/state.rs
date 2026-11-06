@@ -1,6 +1,7 @@
 use crate::logging;
 use crate::types::{Position, TradeResult, TradingDecision};
 use anyhow::{Context, Result};
+use serde::Serialize;
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -54,6 +55,76 @@ pub fn log_decision(
 
     let json = serde_json::to_string(&log).context("序列化决策日志失败")?;
     writeln!(file, "{}", json).context("写入决策日志失败")?;
+
+    Ok(())
+}
+
+// ===== 运行状态快照（供 Dashboard 读取） =====
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountStatus {
+    pub total_wallet_balance: f64,
+    pub available_balance: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PositionStatus {
+    pub symbol: String,
+    pub side: String,
+    pub amount: f64,
+    pub entry_price: f64,
+    pub unrealized_pnl: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RiskStatus {
+    pub halted: bool,
+    pub halt_reason: Option<String>,
+    pub peak_equity: f64,
+    pub last_equity: f64,
+    pub stop_loss_pct: f64,
+    pub take_profit_pct: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusSnapshot {
+    pub updated_at: i64,
+    pub updated_at_text: String,
+    pub account: AccountStatus,
+    pub risk: RiskStatus,
+    pub positions: Vec<PositionStatus>,
+}
+
+/// 原子写入 logs/status.json，避免 Dashboard 读到半个文件。
+pub fn write_status(snapshot: &StatusSnapshot) -> Result<()> {
+    let dir = Path::new(logging::logs_directory());
+    create_dir_all(dir).context("创建logs目录失败")?;
+
+    let path = dir.join("status.json");
+    let tmp = dir.join("status.json.tmp");
+    let json = serde_json::to_string_pretty(snapshot).context("序列化运行状态失败")?;
+    std::fs::write(&tmp, json).context("写入运行状态失败")?;
+    std::fs::rename(&tmp, &path).context("替换运行状态失败")?;
+    Ok(())
+}
+
+/// 每个周期追加一个权益点，供 Dashboard 画曲线。
+pub fn append_equity(timestamp: i64, equity: f64) -> Result<()> {
+    let dir = Path::new(logging::logs_directory());
+    create_dir_all(dir).context("创建logs目录失败")?;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("equity.jsonl"))
+        .context("打开equity.jsonl失败")?;
+
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({"timestamp": timestamp, "equity": equity})
+    )
+    .context("写入权益曲线失败")?;
 
     Ok(())
 }

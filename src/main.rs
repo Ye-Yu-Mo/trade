@@ -2,6 +2,7 @@
 
 mod backtest;
 mod cli;
+mod dashboard;
 mod data;
 mod executor;
 mod llm_client;
@@ -590,6 +591,49 @@ async fn run_portfolio_cycle(
         );
     }
 
+    // 写入 Dashboard 读取的运行状态与权益曲线
+    let positions_status: Vec<state::PositionStatus> = analyses
+        .iter()
+        .filter_map(|analysis| {
+            analysis
+                .position
+                .as_ref()
+                .map(|position| state::PositionStatus {
+                    symbol: analysis.symbol.clone(),
+                    side: format!("{:?}", position.side),
+                    amount: position.amount,
+                    entry_price: position.entry_price,
+                    unrealized_pnl: position.unrealized_pnl,
+                })
+        })
+        .collect();
+
+    let risk_state = risk_guard.state();
+    let now = chrono::Utc::now();
+    let status = state::StatusSnapshot {
+        updated_at: now.timestamp(),
+        updated_at_text: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        account: state::AccountStatus {
+            total_wallet_balance: wallet_equity,
+            available_balance: total_balance,
+        },
+        risk: state::RiskStatus {
+            halted: risk_guard.halted(),
+            halt_reason: risk_guard.halt_reason().map(str::to_string),
+            peak_equity: risk_state.peak_equity,
+            last_equity: risk_state.last_equity,
+            stop_loss_pct: risk_guard.limits.stop_loss_pct,
+            take_profit_pct: risk_guard.limits.take_profit_pct,
+        },
+        positions: positions_status,
+    };
+    if let Err(err) = state::write_status(&status) {
+        warn!("写入运行状态失败: {:#}", err);
+    }
+    if let Err(err) = state::append_equity(status.updated_at, wallet_equity) {
+        warn!("写入权益曲线失败: {:#}", err);
+    }
+
     let mut portfolio_allocation = multi_agent::portfolio_coordinator_allocate(
         &symbols_reports,
         total_balance,
@@ -729,13 +773,30 @@ async fn main() -> Result<()> {
 
     let cli = cli::Cli::parse();
 
-    match cli.command.unwrap_or(cli::Command::Run) {
-        cli::Command::Run => run_live().await,
+    match cli
+        .command
+        .unwrap_or(cli::Command::Run(cli::RunArgs::default()))
+    {
+        cli::Command::Run(args) => run_live(args).await,
         cli::Command::Backtest(args) => cli::run_backtest(*args).await,
+        cli::Command::Dashboard(args) => cli::run_dashboard(args).await,
     }
 }
 
-async fn run_live() -> Result<()> {
+async fn run_live(args: cli::RunArgs) -> Result<()> {
+    if let Some(port) = args.dashboard {
+        let dashboard_config = dashboard::DashboardConfig {
+            logs_dir: std::path::PathBuf::from(logging::logs_directory()),
+            backtest_dir: std::path::PathBuf::from("backtest"),
+        };
+        let host = args.dashboard_host;
+        tokio::spawn(async move {
+            if let Err(err) = dashboard::serve(&host, port, dashboard_config).await {
+                error!("Dashboard 退出: {:#}", err);
+            }
+        });
+    }
+
     // 加载配置
     let config = Config::from_env().context("配置加载失败")?;
 

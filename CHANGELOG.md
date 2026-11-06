@@ -2,6 +2,16 @@
 
 所有值得注意的变更都记录在这里。版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased] — v0.5.0
+
+### Added
+
+- **只读 Dashboard**（`src/dashboard.rs` + `src/dashboard.html`）
+  - `trade dashboard --port 8080` 独立启动，或 `trade run --dashboard 8080` 随交易循环启动
+  - 账户权益曲线、当前持仓、风控状态、最近决策 / 成交、回测结果浏览
+  - 每周期写入 `logs/status.json`（原子替换）与 `logs/equity.jsonl`
+  - 只读、默认绑定 `127.0.0.1`；回测文件查询做了目录穿越校验
+
 ## [Unreleased] — v0.4.0
 
 ### Added

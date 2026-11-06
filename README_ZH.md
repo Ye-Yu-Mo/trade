@@ -219,6 +219,39 @@ LLM 基线每根K线调用一次模型，响应缓存在 `.cache/llm/`，同一�
 
 完整参数见 `cargo run -- backtest --help`。
 
+## Dashboard
+
+只读监控面板，不参与交易，默认只监听本机：
+
+```bash
+# 单独启动，读取 logs/ 与 backtest/
+cargo run --release -- dashboard --port 8080
+
+# 或者随交易循环一起启动
+cargo run --release -- run --dashboard 8080
+```
+
+![Dashboard](docs/dashboard.png)
+
+*示例数据，非真实收益。*
+
+打开 http://127.0.0.1:8080 可以看到：
+
+- 账户权益曲线（`logs/equity.jsonl`，每周期一个点）
+- 当前持仓、风控状态与熔断原因
+- 最近决策与成交
+- 回测结果浏览：收益、回撤、Sharpe、胜率，以及权益曲线
+
+接口全部是只读 GET：
+
+```
+/api/status  /api/performance  /api/risk
+/api/trades  /api/decisions    /api/equity
+/api/backtests  /api/backtest?file=...
+```
+
+没有鉴权，**不要把 `--host` 改成 0.0.0.0 暴露到公网**。
+
 ## 多智能体决策流程
 
 ### 第一阶段：并行行情分析
@@ -365,6 +398,8 @@ TRADE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,ADAUSDT
 src/
 ├── main.rs          实盘 / 测试网交易循环与投资组合协调
 ├── cli.rs           命令行入口（clap）
+├── dashboard.rs     只读监控服务（axum）
+├── dashboard.html   Dashboard 单页（无构建步骤）
 ├── backtest.rs      纸面账户、回测引擎、绩效指标
 ├── strategy.rs      可插拔策略：SMA 交叉、LLM 基线
 ├── risk.rs          确定性风控：止损止盈、熔断、风控状态

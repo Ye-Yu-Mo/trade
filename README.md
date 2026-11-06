@@ -36,6 +36,7 @@ chain from a real DeepSeek run.
 - **Risk Control**: Position monitoring, P&L tracking, fund allocation, error retry
 - **Deterministic Risk Layer**: stop-loss, take-profit, max drawdown and daily loss circuit breakers enforced in code, not by the LLM
 - **Backtesting**: deterministic SMA baseline and an LLM baseline, with fees and slippage. No API key required for the baseline.
+- **Benchmark**: SMA walk-forward vs random vs LLM vs buy & hold, same windows and costs, Markdown leaderboard
 - **LLM Reliability**: JSON mode, request timeouts, retries, and a model-aware response cache
 - **Low Call Volume**: 2 model calls per symbol per cycle (strategy + executor); risk is enforced in code
 - **Agent Trace**: every stage records model, latency, token usage and full JSON output; visible in the dashboard
@@ -266,6 +267,30 @@ All endpoints are read-only GETs:
 
 There is no authentication. **Do not bind it to `0.0.0.0` on a public network.**
 
+## Benchmark
+
+Same range, same costs, same walk-forward windows, four strategies. This is the part that keeps
+the project honest:
+
+```bash
+cargo run --release -- benchmark \
+  --symbols BTCUSDT,ETHUSDT --interval 1h \
+  --start 2025-01-01 --end 2025-06-01
+```
+
+BTCUSDT + ETHUSDT, 1h, train 720 / test 240, fee 5 bps + 2 bps slippage, random seed 42:
+
+| Strategy | Portfolio | Buy & hold | Max DD | Sharpe | Trades | Win rate | Fees |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| SMA walk-forward | -7.42% | +2.86% | 7.54% | -2.28 | 422 | 33.4% | 404.31 |
+| Random (p=0.05) | +0.17% | +2.86% | 4.18% | 0.11 | 213 | 41.8% | 213.36 |
+| Buy & hold | +2.76% | +2.76% | 37.38% | 0.48 | 0 | — | 10.00 |
+
+Out of sample, the SMA rule lost to a coin flip. Buy & hold made more money but with a 37% drawdown.
+`--strategies` also accepts `llm` (one model call per test bar, requires `DEEPSEEK_API_KEY`).
+
+Results are written as Markdown and JSON under `backtest/`.
+
 ## Agent Trace
 
 `trade analyze` runs one complete decision chain without placing orders:
@@ -488,6 +513,7 @@ src/
 ├── dashboard.html   Single-page dashboard (no build step)
 ├── backtest.rs      Paper broker, backtest engine, metrics
 ├── walkforward.rs   Rolling train/test evaluation and portfolio aggregation
+├── benchmark.rs     Strategy leaderboard and Markdown rendering
 ├── strategy.rs      Pluggable strategies: SMA cross, LLM baseline
 ├── risk.rs          Deterministic stops, circuit breakers, risk state
 ├── data.rs          Historical K-line download and local cache

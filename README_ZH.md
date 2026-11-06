@@ -35,6 +35,7 @@ cargo run --release -- demo
 - **风险控制**：持仓监控、盈亏跟踪、资金分配、错误重试
 - **确定性风控**：止损/止盈、最大回撤与日内亏损熔断，由代码强制执行，不依赖 LLM
 - **历史回测**：确定性 SMA 基线与 LLM 基线，内置手续费和滑点，基线策略无需任何 API key
+- **策略基准**：SMA walk-forward / 随机 / LLM / 买入持有，同窗口同成本，输出 Markdown 排行榜
 - **LLM 可靠性**：JSON 模式、超时重试、按模型区分的响应缓存
 - **低调用量**：每个标的每轮 2 次模型调用（策略 + 交易员），风控由代码完成
 - **Agent 决策链**：每一步记录模型、耗时、token 消耗和完整 JSON 输出，Dashboard 可直接查看
@@ -265,6 +266,29 @@ cargo run --release -- run --dashboard 8080
 
 没有鉴权，**不要把 `--host` 改成 0.0.0.0 暴露到公网**。
 
+## 策略基准
+
+同区间、同成本、同一套 walk-forward 窗口，比较四种策略。这是项目保持诚实的部分：
+
+```bash
+cargo run --release -- benchmark \
+  --symbols BTCUSDT,ETHUSDT --interval 1h \
+  --start 2025-01-01 --end 2025-06-01
+```
+
+BTCUSDT + ETHUSDT，1h，训练 720 / 测试 240，手续费 5bps + 滑点 2bps，随机种子 42：
+
+| Strategy | Portfolio | Buy & hold | Max DD | Sharpe | Trades | Win rate | Fees |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| SMA walk-forward | -7.42% | +2.86% | 7.54% | -2.28 | 422 | 33.4% | 404.31 |
+| Random (p=0.05) | +0.17% | +2.86% | 4.18% | 0.11 | 213 | 41.8% | 213.36 |
+| Buy & hold | +2.76% | +2.76% | 37.38% | 0.48 | 0 | — | 10.00 |
+
+样本外，SMA 规则跑输了抛硬币；买入持有收益更高，但最大回撤 37%。
+`--strategies` 也支持 `llm`（每个测试 bar 一次模型调用，需要 `DEEPSEEK_API_KEY`）。
+
+结果会以 Markdown 和 JSON 写入 `backtest/`。
+
 ## Agent 决策链
 
 `trade analyze` 会跑一次完整决策链，但不下单：
@@ -470,6 +494,7 @@ src/
 ├── dashboard.html   Dashboard 单页（无构建步骤）
 ├── backtest.rs      纸面账户、回测引擎、绩效指标
 ├── walkforward.rs   滚动训练/测试评估与组合聚合
+├── benchmark.rs     策略排行榜与 Markdown 渲染
 ├── strategy.rs      可插拔策略：SMA 交叉、LLM 基线
 ├── risk.rs          确定性风控：止损止盈、熔断、风控状态
 ├── data.rs          历史K线下载与本地缓存

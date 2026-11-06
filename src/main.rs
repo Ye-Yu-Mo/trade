@@ -2,6 +2,7 @@
 
 mod analyze;
 mod backtest;
+mod benchmark;
 mod cli;
 mod dashboard;
 mod data;
@@ -827,6 +828,7 @@ async fn main() -> Result<()> {
         cli::Command::Walkforward(args) => cli::run_walkforward(args).await,
         cli::Command::Analyze(args) => cli::run_analyze(args).await,
         cli::Command::Demo(args) => cli::run_demo(args).await,
+        cli::Command::Benchmark(args) => cli::run_benchmark(args).await,
     }
 }
 

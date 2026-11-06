@@ -47,6 +47,27 @@ pub struct WalkForwardConfig {
     pub out_dir: PathBuf,
 }
 
+/// 参与 walk-forward 的策略族。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StrategyFamily {
+    /// 训练窗口内搜索 fast/slow
+    Sma,
+    /// 固定种子的随机基线，可以用来回答“LLM 比随机好多少”
+    Random { seed: u64, flip_prob: f64 },
+    /// 单智能体 LLM，不做参数搜索
+    Llm,
+}
+
+impl StrategyFamily {
+    pub fn label(&self) -> String {
+        match self {
+            StrategyFamily::Sma => "sma_walkforward".to_string(),
+            StrategyFamily::Random { flip_prob, .. } => format!("random(p={:.2})", flip_prob),
+            StrategyFamily::Llm => "llm".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct WindowPlan {
     pub train_start: usize,
@@ -61,11 +82,14 @@ pub struct WindowReport {
     pub train_to: i64,
     pub test_from: i64,
     pub test_to: i64,
-    pub fast: usize,
-    pub slow: usize,
-    pub train_return_pct: f64,
-    pub train_drawdown_pct: f64,
-    pub train_trades: usize,
+    /// "5/20" 或 "p=0.05" 或 "llm"
+    pub params: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub train_return_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub train_drawdown_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub train_trades: Option<usize>,
     pub test_return_pct: f64,
     pub test_drawdown_pct: f64,
     pub test_trades: usize,
@@ -108,12 +132,28 @@ pub struct PortfolioSummary {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WalkForwardReport {
+    pub strategy: String,
     pub config: WalkForwardConfig,
     pub symbols: Vec<SymbolWalkForward>,
     pub portfolio: PortfolioSummary,
 }
 
-pub async fn run(cfg: WalkForwardConfig) -> Result<WalkForwardReport> {
+pub async fn run(
+    cfg: WalkForwardConfig,
+    family: StrategyFamily,
+    api_key: Option<&str>,
+) -> Result<WalkForwardReport> {
+    let report = compute(&cfg, family, api_key).await?;
+    persist(&report)?;
+    print_report(&report);
+    Ok(report)
+}
+
+pub async fn compute(
+    cfg: &WalkForwardConfig,
+    family: StrategyFamily,
+    api_key: Option<&str>,
+) -> Result<WalkForwardReport> {
     if cfg.symbols.is_empty() {
         bail!("至少需要一个标的");
     }
@@ -123,21 +163,28 @@ pub async fn run(cfg: WalkForwardConfig) -> Result<WalkForwardReport> {
     if cfg.initial_balance <= 0.0 {
         bail!("initial_balance 必须为正");
     }
-
-    let grid = parameter_grid(&cfg.fasts, &cfg.slows);
-    if grid.is_empty() {
-        bail!("参数网格为空：需要至少一组 fast < slow");
+    if family == StrategyFamily::Llm && api_key.is_none_or(str::is_empty) {
+        bail!("LLM 策略需要 DEEPSEEK_API_KEY");
     }
 
-    let max_slow = cfg.slows.iter().copied().max().unwrap_or(20);
-    let warmup = cfg.warmup.max(max_slow + 5).max(5);
+    let grid = if family == StrategyFamily::Sma {
+        let grid = parameter_grid(&cfg.fasts, &cfg.slows);
+        if grid.is_empty() {
+            bail!("参数网格为空：需要至少一组 fast < slow");
+        }
+        grid
+    } else {
+        Vec::new()
+    };
+
+    let warmup = effective_warmup(cfg);
     let allocation = cfg.initial_balance / cfg.symbols.len() as f64;
 
     let mut symbol_reports = Vec::new();
     let mut all_trades: Vec<Fill> = Vec::new();
 
     for symbol in &cfg.symbols {
-        info!("walk-forward: {} 开始", symbol);
+        info!("walk-forward: {} / {} 开始", symbol, family.label());
         let klines = data::load_klines(
             symbol,
             &cfg.interval,
@@ -159,25 +206,29 @@ pub async fn run(cfg: WalkForwardConfig) -> Result<WalkForwardReport> {
             );
         }
 
-        let (report, trades) =
-            run_symbol(&cfg, symbol, &klines, &plans, allocation, warmup, &grid).await?;
+        let (report, trades) = run_symbol(
+            cfg, symbol, &klines, &plans, allocation, warmup, family, api_key, &grid,
+        )
+        .await?;
         symbol_reports.push(report);
         all_trades.extend(trades);
     }
 
-    let portfolio = build_portfolio(&cfg, &symbol_reports, &all_trades);
-    let report = WalkForwardReport {
-        config: cfg,
+    let portfolio = build_portfolio(cfg, &symbol_reports, &all_trades);
+    Ok(WalkForwardReport {
+        strategy: family.label(),
+        config: cfg.clone(),
         symbols: symbol_reports,
         portfolio,
-    };
-
-    persist(&report)?;
-    print_report(&report);
-
-    Ok(report)
+    })
 }
 
+pub fn effective_warmup(cfg: &WalkForwardConfig) -> usize {
+    let max_slow = cfg.slows.iter().copied().max().unwrap_or(20);
+    cfg.warmup.max(max_slow + 5).max(5)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_symbol(
     cfg: &WalkForwardConfig,
     symbol: &str,
@@ -185,6 +236,8 @@ async fn run_symbol(
     plans: &[WindowPlan],
     initial_equity: f64,
     warmup: usize,
+    family: StrategyFamily,
+    api_key: Option<&str>,
     grid: &[(usize, usize)],
 ) -> Result<(SymbolWalkForward, Vec<Fill>)> {
     let backtest_cfg = build_backtest_config(cfg, symbol, warmup);
@@ -193,10 +246,33 @@ async fn run_symbol(
     let mut trades: Vec<Fill> = Vec::new();
     let mut windows = Vec::new();
 
-    for plan in plans {
-        let (fast, slow, train) = choose_params(&backtest_cfg, klines, plan, equity, grid).await?;
+    for (index, plan) in plans.iter().enumerate() {
+        let (mut strategy, params, train) = match family {
+            StrategyFamily::Sma => {
+                let (fast, slow, train) =
+                    choose_params(&backtest_cfg, klines, plan, equity, grid).await?;
+                (
+                    Strategy::sma_cross_with(fast, slow),
+                    format!("{}/{}", fast, slow),
+                    Some(train),
+                )
+            }
+            StrategyFamily::Random { seed, flip_prob } => (
+                Strategy::random(seed ^ (index as u64 + 1), flip_prob),
+                format!("p={:.2}", flip_prob),
+                None,
+            ),
+            StrategyFamily::Llm => (
+                Strategy::llm(
+                    api_key
+                        .context("LLM 策略需要 DEEPSEEK_API_KEY")?
+                        .to_string(),
+                ),
+                "llm".to_string(),
+                None,
+            ),
+        };
 
-        let mut strategy = Strategy::sma_cross_with(fast, slow);
         let test = backtest::run_segment(
             &backtest_cfg,
             &mut strategy,
@@ -222,11 +298,10 @@ async fn run_symbol(
             train_to: klines[plan.train_end - 1].timestamp,
             test_from: klines[plan.test_start].timestamp,
             test_to: klines[plan.test_end].timestamp,
-            fast,
-            slow,
-            train_return_pct: train.metrics.total_return_pct,
-            train_drawdown_pct: train.metrics.max_drawdown_pct,
-            train_trades: train.metrics.trade_count,
+            params,
+            train_return_pct: train.as_ref().map(|t| t.metrics.total_return_pct),
+            train_drawdown_pct: train.as_ref().map(|t| t.metrics.max_drawdown_pct),
+            train_trades: train.as_ref().map(|t| t.metrics.trade_count),
             test_return_pct: test.metrics.total_return_pct,
             test_drawdown_pct: test.metrics.max_drawdown_pct,
             test_trades: test.metrics.trade_count,
@@ -311,7 +386,7 @@ fn train_score(metrics: &Metrics) -> f64 {
     metrics.total_return_pct - 0.5 * metrics.max_drawdown_pct
 }
 
-fn aggregate_metrics(
+pub(crate) fn aggregate_metrics(
     initial_equity: f64,
     curve: &[EquityPoint],
     trades: &[Fill],
@@ -354,7 +429,7 @@ fn aggregate_metrics(
     }
 }
 
-fn exposure_and_bars(curve: &[EquityPoint]) -> (f64, usize) {
+pub(crate) fn exposure_and_bars(curve: &[EquityPoint]) -> (f64, usize) {
     if curve.is_empty() {
         return (0.0, 0);
     }
@@ -525,6 +600,7 @@ fn portfolio_csv(points: &[EquityPoint]) -> String {
 fn print_report(report: &WalkForwardReport) {
     println!();
     println!("================ Walk-forward 结果 ================");
+    println!("策略: {}", report.strategy);
     println!(
         "训练 {} 根 / 测试 {} 根 | fast={:?} slow={:?} | 成本 {:.3}% + {:.1}bps",
         report.config.train_bars,
@@ -555,10 +631,10 @@ fn print_report(report: &WalkForwardReport) {
     let m = &report.portfolio.metrics;
     println!("---------------------------------------------------");
     println!(
-        "{:<10} {:>+9.2}% {:>9} {:>8.2}% {:>8.2} {:>7} {:>6.1}%",
+        "{:<10} {:>+9.2}% {:>+8.2}% {:>8.2}% {:>8.2} {:>7} {:>6.1}%",
         "组合(等权)",
         m.total_return_pct,
-        format!("{:+.2}%", report.portfolio.buy_and_hold_pct),
+        report.portfolio.buy_and_hold_pct,
         m.max_drawdown_pct,
         m.sharpe,
         m.trade_count,
@@ -578,7 +654,7 @@ fn print_report(report: &WalkForwardReport) {
     println!();
 }
 
-fn format_time(ms: i64) -> String {
+pub(crate) fn format_time(ms: i64) -> String {
     Utc.timestamp_millis_opt(ms)
         .single()
         .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
@@ -662,5 +738,19 @@ mod tests {
     fn train_score_rejects_no_trade_results() {
         let metrics = Metrics::default();
         assert_eq!(train_score(&metrics), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn family_labels_are_stable() {
+        assert_eq!(StrategyFamily::Sma.label(), "sma_walkforward");
+        assert_eq!(StrategyFamily::Llm.label(), "llm");
+        assert_eq!(
+            StrategyFamily::Random {
+                seed: 1,
+                flip_prob: 0.05
+            }
+            .label(),
+            "random(p=0.05)"
+        );
     }
 }

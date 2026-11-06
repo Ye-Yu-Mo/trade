@@ -2,6 +2,18 @@
 
 所有值得注意的变更都记录在这里。版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased] — v0.9.0
+
+### Added
+
+- **策略基准排行榜**：`trade benchmark`
+  - 同一区间、成本、walk-forward 窗口下比较 SMA / 随机基线 / 单智能体 LLM / 买入持有
+  - 输出可直接贴进 README 的 Markdown 表格 + JSON
+  - LLM 为可选项（`--strategies ...,llm`，每个测试 bar 一次模型调用）
+- **随机基线策略**：固定种子、可复现，用来回答“LLM 比随机猜好多少”
+- Walk-forward 泛化为策略族（`StrategyFamily::{Sma, Random, Llm}`），报告新增 `strategy` 字段
+- 非参数搜索策略的训练指标改为可选（`Option`）
+
 ## [Unreleased] — v0.8.0
 
 ### Added

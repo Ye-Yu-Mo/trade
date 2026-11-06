@@ -4,7 +4,7 @@
 // 这样策略逻辑与资金管理解耦，回测也可复现。
 
 use crate::llm_client;
-use crate::types::{Confidence, Kline, Position, Signal, TechnicalIndicators};
+use crate::types::{Confidence, Kline, Position, PositionSide, Signal, TechnicalIndicators};
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::json;
@@ -41,6 +41,7 @@ impl Direction {
 pub enum Strategy {
     SmaCross(SmaCrossStrategy),
     Llm(LlmStrategy),
+    Random(RandomStrategy),
 }
 
 impl Strategy {
@@ -56,10 +57,15 @@ impl Strategy {
         Strategy::Llm(LlmStrategy { api_key })
     }
 
+    pub fn random(seed: u64, flip_prob: f64) -> Self {
+        Strategy::Random(RandomStrategy::new(seed, flip_prob))
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Strategy::SmaCross(_) => "sma_cross",
             Strategy::Llm(_) => "llm",
+            Strategy::Random(_) => "random",
         }
     }
 
@@ -67,6 +73,7 @@ impl Strategy {
         match self {
             Strategy::SmaCross(s) => Ok(s.decide(ctx)),
             Strategy::Llm(s) => s.decide(ctx).await,
+            Strategy::Random(s) => Ok(s.decide(ctx)),
         }
     }
 }
@@ -160,6 +167,68 @@ fn sma(window: &[Kline], period: usize) -> Option<f64> {
         .map(|k| k.close)
         .sum();
     Some(sum / period as f64)
+}
+
+// ========== 随机基线 ==========
+//
+// 用来回答一个很基本的问题：LLM 比随机猜好多少？
+// 固定种子，结果可复现。
+
+pub struct RandomStrategy {
+    state: u64,
+    flip_prob: f64,
+}
+
+impl RandomStrategy {
+    pub fn new(seed: u64, flip_prob: f64) -> Self {
+        Self {
+            state: seed.max(1),
+            flip_prob: flip_prob.clamp(0.0, 1.0),
+        }
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        // xorshift64*
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        let value = x.wrapping_mul(0x2545F4914F6CDD1D);
+        (value >> 11) as f64 / ((1u64 << 53) as f64)
+    }
+
+    fn decide(&mut self, ctx: &BarContext<'_>) -> Direction {
+        if self.next_f64() > self.flip_prob {
+            return Direction::hold("随机策略：保持");
+        }
+
+        let roll = self.next_f64();
+        let (signal, reason) = match ctx.position {
+            None => {
+                if roll < 0.5 {
+                    (Signal::Buy, "随机策略：开多")
+                } else {
+                    (Signal::Sell, "随机策略：开空")
+                }
+            }
+            Some(position) => {
+                if roll < 0.5 {
+                    (Signal::Close, "随机策略：平仓")
+                } else if position.side == PositionSide::Long {
+                    (Signal::Sell, "随机策略：反手做空")
+                } else {
+                    (Signal::Buy, "随机策略：反手做多")
+                }
+            }
+        };
+
+        Direction {
+            signal,
+            confidence: Confidence::High,
+            reason: reason.to_string(),
+        }
+    }
 }
 
 // ========== LLM 单智能体基线 ==========
@@ -371,6 +440,18 @@ mod tests {
             SmaCrossStrategy::default().decide(&ctx).signal,
             Signal::Hold
         );
+    }
+
+    #[test]
+    fn random_strategy_is_deterministic() {
+        let window = bars(&[100.0; 20]);
+        let ind = indicators();
+        let ctx = context(&window, &ind);
+        let mut a = RandomStrategy::new(42, 1.0);
+        let mut b = RandomStrategy::new(42, 1.0);
+        for _ in 0..20 {
+            assert_eq!(a.decide(&ctx).signal, b.decide(&ctx).signal);
+        }
     }
 
     #[test]

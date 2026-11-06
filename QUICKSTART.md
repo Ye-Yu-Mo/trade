@@ -64,6 +64,10 @@ cargo run --release -- backtest --strategy llm --max-bars 200
 # 查看全部回测参数
 cargo run --release -- backtest --help
 
+# 策略基准排行榜（SMA / 随机 / 买入持有）
+cargo run --release -- benchmark --symbols BTCUSDT,ETHUSDT --interval 1h \
+  --start 2025-01-01 --end 2025-06-01
+
 # Walk-forward 样本外回测
 cargo run --release -- walkforward --symbols BTCUSDT,ETHUSDT --interval 1h \
   --start 2025-01-01 --end 2025-06-01

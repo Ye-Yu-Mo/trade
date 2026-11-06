@@ -5,11 +5,12 @@
 
 use crate::analyze;
 use crate::backtest::{self, BacktestConfig};
+use crate::benchmark::{self, BenchmarkStrategy};
 use crate::dashboard;
 use crate::data;
 use crate::demo;
 use crate::strategy::Strategy;
-use crate::walkforward::{self, WalkForwardConfig};
+use crate::walkforward::{self, StrategyFamily, WalkForwardConfig};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -43,6 +44,8 @@ pub enum Command {
     Analyze(AnalyzeArgs),
     /// 离线 Demo：无需 API key，一条命令启动带示例数据的 Dashboard
     Demo(DemoArgs),
+    /// 在同一窗口和成本下比较 SMA / 随机 / LLM / 买入持有
+    Benchmark(BenchmarkArgs),
 }
 
 #[derive(Debug, Args, Default)]
@@ -178,6 +181,24 @@ pub struct DemoArgs {
     /// 只生成数据，不启动 Dashboard
     #[arg(long)]
     pub no_server: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct BenchmarkArgs {
+    #[command(flatten)]
+    pub walkforward: WalkForwardArgs,
+
+    /// 参与基准的策略，逗号分隔：sma,random,llm,buy_hold
+    #[arg(long, default_value = "sma,random,buy_hold")]
+    pub strategies: String,
+
+    /// 随机基线种子
+    #[arg(long, default_value_t = 42)]
+    pub seed: u64,
+
+    /// 随机基线每根K线行动的概率
+    #[arg(long, default_value_t = 0.05)]
+    pub flip_prob: f64,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -368,7 +389,7 @@ fn parse_usize_list(input: &str, label: &str) -> Result<Vec<usize>> {
     Ok(values)
 }
 
-pub async fn run_walkforward(args: WalkForwardArgs) -> Result<()> {
+fn build_walkforward_config(args: &WalkForwardArgs) -> Result<WalkForwardConfig> {
     let symbols: Vec<String> = args
         .symbols
         .split(',')
@@ -385,9 +406,9 @@ pub async fn run_walkforward(args: WalkForwardArgs) -> Result<()> {
     let slows = parse_usize_list(&args.slow, "--slow")?;
     let (start_ms, end_ms) = resolve_range(&args.start, &args.end, &args.interval, 365)?;
 
-    let config = WalkForwardConfig {
+    Ok(WalkForwardConfig {
         symbols,
-        interval: args.interval,
+        interval: args.interval.clone(),
         start_ms,
         end_ms,
         train_bars: args.train_bars,
@@ -402,11 +423,52 @@ pub async fn run_walkforward(args: WalkForwardArgs) -> Result<()> {
         slippage_bps: args.slippage_bps,
         stop_loss_pct: args.stop_loss_pct,
         take_profit_pct: args.take_profit_pct,
-        data_dir: args.data_dir,
-        out_dir: args.out_dir,
+        data_dir: args.data_dir.clone(),
+        out_dir: args.out_dir.clone(),
+    })
+}
+
+pub async fn run_walkforward(args: WalkForwardArgs) -> Result<()> {
+    let config = build_walkforward_config(&args)?;
+    walkforward::run(config, StrategyFamily::Sma, None).await?;
+    Ok(())
+}
+
+pub async fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
+    let config = build_walkforward_config(&args.walkforward)?;
+
+    let mut strategies = Vec::new();
+    for raw in args.strategies.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        strategies.push(BenchmarkStrategy::parse(raw)?);
+    }
+    strategies.dedup();
+
+    if strategies.is_empty() {
+        bail!("--strategies 不能为空");
+    }
+
+    let api_key = if strategies.contains(&BenchmarkStrategy::Llm) {
+        Some(
+            env::var("DEEPSEEK_API_KEY")
+                .map_err(|_| anyhow!("benchmark 包含 llm 时需要 DEEPSEEK_API_KEY"))?,
+        )
+    } else {
+        None
     };
 
-    walkforward::run(config).await?;
+    benchmark::run(benchmark::BenchmarkConfig {
+        walkforward: config,
+        strategies,
+        seed: args.seed,
+        flip_prob: args.flip_prob,
+        api_key,
+    })
+    .await?;
+
     Ok(())
 }
 

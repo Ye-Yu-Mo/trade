@@ -20,6 +20,8 @@ A multi-agent collaborative portfolio trading bot built with Rust, using DeepSee
 - **Risk Control**: Position monitoring, P&L tracking, fund allocation, error retry
 - **Deterministic Risk Layer**: stop-loss, take-profit, max drawdown and daily loss circuit breakers enforced in code, not by the LLM
 - **Backtesting**: deterministic SMA baseline and an LLM baseline, with fees and slippage. No API key required for the baseline.
+- **LLM Reliability**: JSON mode, request timeouts, retries, and a model-aware response cache
+- **Low Call Volume**: 2 model calls per symbol per cycle (strategy + executor); risk is enforced in code
 
 ## System Architecture
 
@@ -45,7 +47,7 @@ flowchart TD
     G --> H[Strategy Researcher]
     H --> I[StrategySuggestion]
     
-    I --> J[Risk Manager]
+    I --> J[Risk Manager (code)]
     J --> K[RiskAssessment]
     
     K --> L[Trade Executor<br/>executor.rs]
@@ -90,10 +92,9 @@ flowchart TD
    - Suggest target positions, stop-loss, take-profit
    - Output: `StrategySuggestion`
 
-3. **Risk Manager**
-   - Assess trading risks, approve strategies
-   - Calculate suggested trade quantities
-   - Output: `RiskAssessment`
+3. **Risk Manager** (`src/risk.rs`, deterministic)
+   - Applies timing score, volatility, trend consistency, position limits and exchange constraints
+   - Produces `RiskAssessment` without calling the LLM; the trade executor cannot override it
 
 4. **Trade Executor** (`executor.rs`)
    - Make final decisions based on all inputs

@@ -1,6 +1,5 @@
 // 多智能体交易决策系统
 
-use crate::executor::{AccountInfo, SymbolConstraints};
 use crate::llm_client;
 use crate::types::*;
 use anyhow::{Context, Result};
@@ -115,61 +114,6 @@ fn structured_prompt(
         data = data,
         output_format = output_format
     ))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_risk_manager_prompt(
-    symbol: &str,
-    market_report: &MarketReport,
-    strategy: &StrategyAdvice,
-    account: &AccountInfo,
-    position: &Option<Position>,
-    constraints: &SymbolConstraints,
-    allocated_balance: f64,
-    allocated_max_amount: f64,
-    max_position: f64,
-) -> Result<String> {
-    let available_balance = account.availableBalance.parse::<f64>().unwrap_or(0.0);
-    let total_balance = account.totalWalletBalance.parse::<f64>().unwrap_or(0.0);
-    let used_balance = (total_balance - available_balance).max(0.0);
-    let position_value = position
-        .as_ref()
-        .map(|pos| pos.amount * pos.entry_price)
-        .unwrap_or(0.0);
-
-    let payload = json!({
-        "symbol": symbol,
-        "market_report": market_report,
-        "strategy": strategy,
-        "position": position,
-        "account": {
-            "available_balance": available_balance,
-            "total_balance": total_balance,
-            "used_balance": used_balance
-        },
-        "position_value": position_value,
-        "limits": {
-            "step_size": constraints.step_size,
-            "min_qty": constraints.min_qty,
-            "max_qty": constraints.max_qty,
-            "min_notional": constraints.min_notional,
-            "allocated_balance": allocated_balance,
-            "allocated_max_amount": allocated_max_amount,
-            "max_position": max_position
-        }
-    });
-
-    structured_prompt(
-        "输入包含账户资源、当前仓位、策略建议与市场分析（JSON），请评估风险并给出审批结论。",
-        &payload,
-        r#"{
-  "risk_level": "low" | "medium" | "high",
-  "suggested_amount": 数字,
-  "approval": "approved" | "adjusted" | "rejected",
-  "warnings": ["可选风险提示"],
-  "reason": "风险评估结论，<=50字"
-}"#,
-    )
 }
 
 fn build_market_analyst_prompt(
@@ -303,8 +247,7 @@ pub async fn market_analyst_analyze(
     api_key: &str,
 ) -> Result<MarketReport> {
     let prompt = build_market_analyst_prompt(symbol, interval, klines, indicators)?;
-    let response = llm_client::chat(get_market_analyst_system_prompt(), &prompt, api_key).await?;
-    llm_client::parse_json(&response)
+    llm_client::chat_json(get_market_analyst_system_prompt(), &prompt, api_key).await
 }
 
 // ========== 2. 策略研究员 (Strategy Researcher) ==========
@@ -445,138 +388,7 @@ pub async fn strategy_researcher_suggest(
     api_key: &str,
 ) -> Result<StrategyAdvice> {
     let prompt = build_strategy_researcher_prompt(symbol, market_report, position)?;
-    let response =
-        llm_client::chat(get_strategy_researcher_system_prompt(), &prompt, api_key).await?;
-    llm_client::parse_json(&response)
-}
-
-// ========== 3. 风险管理员 (Risk Manager) ==========
-
-fn get_risk_manager_system_prompt() -> &'static str {
-    r#"## 角色定义
-
-你是一位 **加密货币风险管理员（Risk Manager）**，曾在投资银行风控部门工作多年，见证过无数因忽视风险而爆仓的案例。你的职责不是帮助交易员赚钱，而是**确保他们能活着看到明天的太阳**。
-
-你是团队中最不受欢迎的人，因为你总是说"不"。但你也是最重要的人，因为你是最后一道防线。
-
-你的职责是**评估每一笔交易的风险敞口，在贪婪与理性之间划出红线，并保持对市场的敬畏**。
-
----
-
-## 我的核心哲学
-
-**1. "先活下来，再谈盈利" — 我的生存法则**
-
-> "控制风险的能力，比预测方向的能力重要100倍。"
-
-* 没有止损的信念，叫做幻想。
-* 盈利是奖励，但生存是前提。
-* 市场会原谅你的无知，但不会原谅你的贪婪。
-
----
-
-**2. "聪明人死于杠杆，天才死于自信" — 我的警示箴言**
-
-> "永远给市场留下犯错的空间。"
-
-* LTCM的天才们用一个公式证明：智商与生存能力无关。
-* 杠杆是放大器，它放大收益，更放大人性的弱点。
-* 市场不关心你有多聪明，只关心你能承受多少痛苦。
-
----
-
-**3. "规则是铁律，不是建议" — 我的工作准则**
-
-> "风控不是协商，而是底线。"
-
-* 风险限额不是用来突破的，而是用来服从的。
-* 每一次"这次不一样"，都是下一次爆仓的序幕。
-* 我的职责不是让你开心，而是让你安全。
-
----
-
-**4. "恐惧是理性的另一个名字" — 我的情绪管理**
-
-> "当所有人都勇敢时，我选择恐惧。"
-
-* 市场最危险的时刻，是所有人都觉得安全的时刻。
-* 恐惧让我谨慎，谨慎让我生存，生存让我盈利。
-* 优秀的风控不是消除风险，而是确保风险可控。
-
----
-
-## 风险评估框架
-
-**第一层：账户风险检查**
-
-* 可用余额是否充足？（最少保留30%缓冲）
-* 单次交易占总资金比例是否过大？（建议<5%）
-* 是否会超过最大持仓限制？
-* 当前杠杆倍数下，能承受多大回撤？
-
-**第二层：市场风险评估**
-
-* 趋势强度是否足够支撑这个操作？
-* 时机评分是否达到可操作标准？（建议≥6分）
-* 当前波动率是否异常？
-* 是否存在突发事件风险（政策、黑天鹅）？
-
-**第三层：策略风险验证**
-
-* 策略逻辑是否清晰？
-* 操作与当前仓位是否冲突？
-* 是否存在过度交易倾向？
-* 止损机制是否明确？
-
-**第四层：审批决策**
-
-* approved: 完全批准，风险可控
-* adjusted: 调整交易数量后批准，降低敞口
-* rejected: 拒绝交易，风险过高或逻辑不清
-
----
-
-## 输出要求
-
-严格返回JSON格式：
-
-{
-  "risk_level": "low"|"medium"|"high",
-  "suggested_amount": 0.001,
-  "approval": "approved"|"adjusted"|"rejected",
-  "warnings": ["风险点1", "风险点2"],
-  "reason": "风险评估理由，50字内"
-}
-
-**禁止输出任何JSON之外的内容。**"#
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn risk_manager_assess(
-    symbol: &str,
-    market_report: &MarketReport,
-    strategy: &StrategyAdvice,
-    account: &AccountInfo,
-    position: &Option<Position>,
-    constraints: &SymbolConstraints,
-    allocated_balance: f64,
-    allocated_max_amount: f64,
-    max_position: f64,
-    api_key: &str,
-) -> Result<RiskAssessment> {
-    let prompt = build_risk_manager_prompt(
-        symbol,
-        market_report,
-        strategy,
-        account,
-        position,
-        constraints,
-        allocated_balance,
-        allocated_max_amount,
-        max_position,
-    )?;
-    let response = llm_client::chat(get_risk_manager_system_prompt(), &prompt, api_key).await?;
-    llm_client::parse_json(&response)
+    llm_client::chat_json(get_strategy_researcher_system_prompt(), &prompt, api_key).await
 }
 
 // ========== 4. 决策交易员 (Trade Executor) ==========
@@ -726,8 +538,7 @@ pub async fn trade_executor_decide(
     api_key: &str,
 ) -> Result<TradingDecision> {
     let prompt = build_trade_executor_prompt(symbol, market_report, strategy, risk)?;
-    let response = llm_client::chat(get_trade_executor_system_prompt(), &prompt, api_key).await?;
-    llm_client::parse_json(&response)
+    llm_client::chat_json(get_trade_executor_system_prompt(), &prompt, api_key).await
 }
 // ========== 5. 投资组合协调员 (Portfolio Coordinator) ==========
 
@@ -876,7 +687,5 @@ pub async fn portfolio_coordinator_allocate(
 ) -> Result<PortfolioAllocation> {
     let prompt =
         build_portfolio_coordinator_prompt(total_balance, portfolio_strategy, symbols_reports)?;
-    let response =
-        llm_client::chat(get_portfolio_coordinator_system_prompt(), &prompt, api_key).await?;
-    llm_client::parse_json(&response)
+    llm_client::chat_json(get_portfolio_coordinator_system_prompt(), &prompt, api_key).await
 }

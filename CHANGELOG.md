@@ -2,6 +2,24 @@
 
 所有值得注意的变更都记录在这里。版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased] — v0.6.0
+
+### Added
+
+- **LLM 请求可靠性**
+  - 默认开启 JSON 模式（`response_format=json_object`）
+  - 单次请求超时（默认 60 秒）与重试（默认 1 次）
+  - JSON 解析失败时自动作废缓存并重新请求一次
+  - 模型、温度、超时、重试均可配置：`DEEPSEEK_MODEL`、`LLM_TEMPERATURE`、`LLM_TIMEOUT_SECS`、`LLM_MAX_RETRIES`、`LLM_JSON_MODE`
+  - 缓存键包含模型、base URL、温度和 JSON 模式，换模型不会误用旧响应
+
+### Changed
+
+- **风险管理员改为确定性代码**（`risk::assess`）：按时机评分、ATR、趋势一致性、仓位上限和交易所约束计算 `RiskAssessment`，不再调用 LLM
+  - 交易员 LLM 的结论由 `risk::enforce` 强制约束：`rejected` 直接 HOLD，`adjusted` 数量被截断
+- 每个标的的模型调用从 3 次降到 2 次（策略 + 交易员），整轮从 `4N+1` 降到 `3N+1`
+- 所有智能体改用 `chat_json`，统一 JSON 解析与失败重试
+
 ## [Unreleased] — v0.5.0
 
 ### Added

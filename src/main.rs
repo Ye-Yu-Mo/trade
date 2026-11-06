@@ -36,6 +36,8 @@ struct SymbolAnalysis {
     symbol: String,
     position: Option<types::Position>,
     market_report: types::MarketReport,
+    last_price: f64,
+    atr_percent: f64,
 }
 
 fn adjust_trade_quantity(
@@ -235,6 +237,8 @@ async fn analyze_symbol(
         symbol,
         position,
         market_report,
+        last_price: klines.last().map(|k| k.close).unwrap_or(0.0),
+        atr_percent: indicators.atr_percent,
     })
 }
 
@@ -300,20 +304,19 @@ async fn execute_symbol_cycle(
             info!("建议止盈: {:.2}%", tp * 100.0);
         }
 
-        // 风险管理员
-        let risk = multi_agent::risk_manager_assess(
-            &analysis.symbol,
-            &analysis.market_report,
-            &strategy,
-            account,
-            &analysis.position,
-            constraints,
+        // 风险管理员：确定性代码，不调用模型
+        let risk = risk::assess(&risk::RiskRequest {
+            market_report: &analysis.market_report,
+            strategy: &strategy,
+            position: &analysis.position,
+            equity: account.totalWalletBalance.parse().unwrap_or(0.0),
             allocated_balance,
             allocated_max_amount,
-            config.max_position,
-            &config.deepseek_api_key,
-        )
-        .await?;
+            max_position: config.max_position,
+            price: analysis.last_price,
+            atr_percent: analysis.atr_percent,
+            constraints,
+        });
         info!(
             "风险管理员: {:?} | 审批: {:?} | 建议数量: {:.4} | {}",
             risk.risk_level, risk.approval, risk.suggested_amount, risk.reason
@@ -336,6 +339,8 @@ async fn execute_symbol_cycle(
             decision.signal, decision.amount, decision.confidence, decision.reason
         );
 
+        // LLM 不能覆盖风控结论
+        risk::enforce(&mut decision, &risk);
         // 代码层的最后一道闸门：熔断期间不允许开启新敞口
         risk_guard.gate(&mut decision, &analysis.position);
         info!("--- 多智能体决策完成 ---");

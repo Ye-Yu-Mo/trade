@@ -3,8 +3,12 @@
 // 原则：LLM 只能提出意图，代码决定能不能执行。
 // 这里不调用任何模型，所有规则都可以被单元测试覆盖。
 
+use crate::executor::{quantize_down, SymbolConstraints};
 use crate::logging;
-use crate::types::{Position, PositionSide, Signal, TradingDecision};
+use crate::types::{
+    ApprovalStatus, MarketReport, Position, PositionSide, RiskAssessment, RiskLevel, Signal,
+    StrategyAction, StrategyAdvice, TradingDecision, TrendDirection,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -275,6 +279,215 @@ impl RiskGuard {
     }
 }
 
+/// 确定性风险评估的输入。
+pub struct RiskRequest<'a> {
+    pub market_report: &'a MarketReport,
+    pub strategy: &'a StrategyAdvice,
+    pub position: &'a Option<Position>,
+    pub equity: f64,
+    pub allocated_balance: f64,
+    pub allocated_max_amount: f64,
+    pub max_position: f64,
+    pub price: f64,
+    pub atr_percent: f64,
+    pub constraints: &'a SymbolConstraints,
+}
+
+/// 用代码替代 LLM 风险管理员。
+///
+/// 规则是可测试、可复现的：时机评分、波动率、趋势一致性、仓位上限、交易所约束。
+/// 交易员仍然会看到一份 `RiskAssessment`，但它不能覆盖这里的结论。
+pub fn assess(req: &RiskRequest<'_>) -> RiskAssessment {
+    let mut warnings = Vec::new();
+
+    match req.strategy.action {
+        StrategyAction::Hold => {
+            return RiskAssessment {
+                risk_level: RiskLevel::Low,
+                suggested_amount: 0.0,
+                approval: ApprovalStatus::Approved,
+                warnings,
+                reason: "持有/观望，无新增风险".to_string(),
+            };
+        }
+        StrategyAction::ClosePosition => {
+            let amount = req.position.as_ref().map(|p| p.amount).unwrap_or(0.0);
+            return RiskAssessment {
+                risk_level: RiskLevel::Low,
+                suggested_amount: amount,
+                approval: ApprovalStatus::Approved,
+                warnings,
+                reason: "平仓指令，无需新增风险预算".to_string(),
+            };
+        }
+        _ => {}
+    }
+
+    if req.price <= 0.0 {
+        return rejected("价格无效");
+    }
+    if req.equity <= 0.0 {
+        return rejected("账户权益无效");
+    }
+    if req.allocated_balance <= 0.0 {
+        return rejected("未分配可用资金");
+    }
+    if req.allocated_max_amount <= 0.0 {
+        return rejected("分配数量上限为零");
+    }
+
+    let current_qty = req.position.as_ref().map(|p| p.amount).unwrap_or(0.0);
+    let remaining = (req.max_position - current_qty).max(0.0);
+    if remaining <= 0.0 {
+        return rejected(format!("已达最大持仓 {:.4}", req.max_position));
+    }
+
+    if req.strategy.timing_score < 5 {
+        return rejected(format!(
+            "时机评分 {}/10 低于阈值 5",
+            req.strategy.timing_score
+        ));
+    }
+    if req.atr_percent >= 8.0 {
+        return rejected(format!("ATR {:.2}% 波动过高", req.atr_percent));
+    }
+
+    let mut approval = ApprovalStatus::Approved;
+    let mut factor = 1.0;
+    let mut risk_level = RiskLevel::Low;
+
+    if req.strategy.timing_score < 7 {
+        approval = ApprovalStatus::Adjusted;
+        factor *= 0.5;
+        risk_level = RiskLevel::Medium;
+        warnings.push(format!(
+            "时机评分 {}/10，仓位减半",
+            req.strategy.timing_score
+        ));
+    }
+
+    if req.atr_percent >= 5.0 {
+        approval = ApprovalStatus::Adjusted;
+        factor *= 0.5;
+        risk_level = RiskLevel::High;
+        warnings.push(format!("ATR {:.2}% 偏高，仓位再减半", req.atr_percent));
+    } else if req.atr_percent >= 2.5 && risk_level == RiskLevel::Low {
+        risk_level = RiskLevel::Medium;
+    }
+
+    if let Some(desired) = desired_side(req.strategy, req.position) {
+        let contradiction = matches!(
+            (desired, &req.market_report.trend),
+            (PositionSide::Long, TrendDirection::Bearish)
+                | (PositionSide::Short, TrendDirection::Bullish)
+        );
+        if contradiction {
+            approval = ApprovalStatus::Adjusted;
+            factor *= 0.5;
+            risk_level = RiskLevel::High;
+            warnings.push("策略方向与行情趋势相反，仓位减半".to_string());
+        }
+    }
+
+    let target_pct = req
+        .strategy
+        .target_position_pct
+        .unwrap_or(0.2)
+        .clamp(0.0, 1.0);
+    let balance_cap = req.allocated_balance.min(req.equity);
+    let amount_cap = req.allocated_max_amount.max(0.0);
+    let target_notional = req.equity * target_pct;
+    let notional = target_notional.min(balance_cap).min(amount_cap * req.price);
+    let mut qty = (notional / req.price) * factor;
+
+    let min_notional_qty = if req.constraints.min_notional > 0.0 {
+        req.constraints.min_notional / req.price
+    } else {
+        0.0
+    };
+    let min_required = req.constraints.min_qty.max(min_notional_qty);
+
+    if min_required > remaining
+        || min_required > amount_cap
+        || min_required * req.price > balance_cap
+    {
+        return rejected(format!("最小可交易数量 {:.6} 超出可用额度", min_required));
+    }
+
+    qty = qty.max(min_required).min(remaining).min(amount_cap);
+    qty = quantize_down(qty, req.constraints.step_size);
+
+    if qty < min_required {
+        return rejected(format!(
+            "量化后数量 {:.6} 低于最小要求 {:.6}",
+            qty, min_required
+        ));
+    }
+    if qty <= 0.0 {
+        return rejected("计算数量为零");
+    }
+
+    let reason = format!(
+        "时机 {}/10，ATR {:.2}%，建议数量 {:.6}",
+        req.strategy.timing_score, req.atr_percent, qty
+    );
+
+    RiskAssessment {
+        risk_level,
+        suggested_amount: qty,
+        approval,
+        warnings,
+        reason,
+    }
+}
+
+/// 把风险评估的结论强制落到最终决策上。
+/// 交易员的 LLM 输出只能在这个范围内调整。
+pub fn enforce(decision: &mut TradingDecision, assessment: &RiskAssessment) {
+    if matches!(assessment.approval, ApprovalStatus::Rejected) {
+        decision.signal = Signal::Hold;
+        decision.amount = 0.0;
+        decision.reason = format!("[风控拒绝] {} | {}", assessment.reason, decision.reason);
+        return;
+    }
+
+    if matches!(decision.signal, Signal::Buy | Signal::Sell) {
+        if assessment.suggested_amount <= 0.0 {
+            decision.signal = Signal::Hold;
+            decision.amount = 0.0;
+            decision.reason = format!("[风控无额度] {} | {}", assessment.reason, decision.reason);
+        } else if decision.amount > assessment.suggested_amount {
+            decision.amount = assessment.suggested_amount;
+            decision.reason = format!(
+                "{} (风控上限 {:.6})",
+                decision.reason, assessment.suggested_amount
+            );
+        }
+    }
+}
+
+fn rejected(reason: impl Into<String>) -> RiskAssessment {
+    RiskAssessment {
+        risk_level: RiskLevel::High,
+        suggested_amount: 0.0,
+        approval: ApprovalStatus::Rejected,
+        warnings: Vec::new(),
+        reason: reason.into(),
+    }
+}
+
+fn desired_side(strategy: &StrategyAdvice, position: &Option<Position>) -> Option<PositionSide> {
+    match strategy.action {
+        StrategyAction::OpenLong => Some(PositionSide::Long),
+        StrategyAction::OpenShort => Some(PositionSide::Short),
+        StrategyAction::AddPosition => strategy
+            .target_side
+            .clone()
+            .or_else(|| position.as_ref().map(|p| p.side.clone())),
+        _ => None,
+    }
+}
+
 /// 与 RiskGuard 解耦的纯函数，回测和实盘共用。
 pub fn exit_reason_for(
     position: &Position,
@@ -525,5 +738,204 @@ mod tests {
         };
         g.gate(&mut decision, &Some(short));
         assert_eq!(decision.signal, Signal::Close);
+    }
+}
+
+#[cfg(test)]
+mod assess_tests {
+    use super::*;
+    use crate::types::{MarketPhase, TrendStrength};
+
+    fn constraints() -> SymbolConstraints {
+        SymbolConstraints {
+            step_size: 0.001,
+            min_qty: 0.001,
+            max_qty: Some(100.0),
+            min_notional: 5.0,
+            tick_size: 0.1,
+        }
+    }
+
+    fn report(trend: TrendDirection) -> MarketReport {
+        MarketReport {
+            trend,
+            strength: TrendStrength::Medium,
+            market_phase: MarketPhase::Markup,
+            support: 90.0,
+            resistance: 110.0,
+            analysis: String::new(),
+        }
+    }
+
+    fn strategy(action: StrategyAction, score: u8) -> StrategyAdvice {
+        StrategyAdvice {
+            action,
+            reasoning: String::new(),
+            timing_score: score,
+            target_side: Some(PositionSide::Long),
+            target_position_pct: Some(0.2),
+            stop_loss_pct: None,
+            take_profit_pct: None,
+        }
+    }
+
+    fn request<'a>(
+        strategy: &'a StrategyAdvice,
+        report: &'a MarketReport,
+        position: &'a Option<Position>,
+        constraints: &'a SymbolConstraints,
+    ) -> RiskRequest<'a> {
+        RiskRequest {
+            market_report: report,
+            strategy,
+            position,
+            equity: 10_000.0,
+            allocated_balance: 2_000.0,
+            allocated_max_amount: 1.0,
+            max_position: 1.0,
+            price: 100.0,
+            atr_percent: 1.0,
+            constraints,
+        }
+    }
+
+    #[test]
+    fn normal_open_is_approved() {
+        let s = strategy(StrategyAction::OpenLong, 8);
+        let r = report(TrendDirection::Bullish);
+        let pos = None;
+        let c = constraints();
+        let assessment = assess(&request(&s, &r, &pos, &c));
+        assert_eq!(assessment.approval, ApprovalStatus::Approved);
+        assert!(assessment.suggested_amount > 0.0);
+        assert!(assessment.suggested_amount <= 1.0);
+    }
+
+    #[test]
+    fn low_timing_score_is_rejected() {
+        let s = strategy(StrategyAction::OpenLong, 3);
+        let r = report(TrendDirection::Bullish);
+        let pos = None;
+        let c = constraints();
+        let assessment = assess(&request(&s, &r, &pos, &c));
+        assert_eq!(assessment.approval, ApprovalStatus::Rejected);
+        assert_eq!(assessment.suggested_amount, 0.0);
+    }
+
+    #[test]
+    fn extreme_volatility_is_rejected() {
+        let s = strategy(StrategyAction::OpenLong, 9);
+        let r = report(TrendDirection::Bullish);
+        let pos = None;
+        let c = constraints();
+        let mut req = request(&s, &r, &pos, &c);
+        req.atr_percent = 9.0;
+        assert_eq!(assess(&req).approval, ApprovalStatus::Rejected);
+    }
+
+    #[test]
+    fn counter_trend_is_adjusted_and_halved() {
+        let s = strategy(StrategyAction::OpenLong, 9);
+        let r = report(TrendDirection::Bearish);
+        let pos = None;
+        let c = constraints();
+        let bullish = report(TrendDirection::Bullish);
+        let normal = assess(&request(
+            &strategy(StrategyAction::OpenLong, 9),
+            &bullish,
+            &pos,
+            &c,
+        ));
+        let counter = assess(&request(&s, &r, &pos, &c));
+        assert_eq!(counter.approval, ApprovalStatus::Adjusted);
+        assert!(counter.suggested_amount < normal.suggested_amount);
+    }
+
+    #[test]
+    fn max_position_is_rejected() {
+        let s = strategy(StrategyAction::AddPosition, 9);
+        let r = report(TrendDirection::Bullish);
+        let pos = Some(Position {
+            side: PositionSide::Long,
+            amount: 1.0,
+            entry_price: 100.0,
+            unrealized_pnl: 0.0,
+        });
+        let c = constraints();
+        assert_eq!(
+            assess(&request(&s, &r, &pos, &c)).approval,
+            ApprovalStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn close_position_uses_full_position_amount() {
+        let s = strategy(StrategyAction::ClosePosition, 9);
+        let r = report(TrendDirection::Bullish);
+        let pos = Some(Position {
+            side: PositionSide::Long,
+            amount: 0.5,
+            entry_price: 100.0,
+            unrealized_pnl: 0.0,
+        });
+        let c = constraints();
+        let assessment = assess(&request(&s, &r, &pos, &c));
+        assert_eq!(assessment.approval, ApprovalStatus::Approved);
+        assert!((assessment.suggested_amount - 0.5).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod enforce_tests {
+    use super::*;
+    use crate::types::Confidence;
+
+    fn decision(signal: Signal, amount: f64) -> TradingDecision {
+        TradingDecision {
+            signal,
+            reason: "llm".to_string(),
+            confidence: Confidence::High,
+            amount,
+        }
+    }
+
+    fn assessment(approval: ApprovalStatus, suggested: f64) -> RiskAssessment {
+        RiskAssessment {
+            risk_level: RiskLevel::Medium,
+            suggested_amount: suggested,
+            approval,
+            warnings: Vec::new(),
+            reason: "risk".to_string(),
+        }
+    }
+
+    #[test]
+    fn rejected_forces_hold() {
+        let mut d = decision(Signal::Buy, 1.0);
+        enforce(&mut d, &assessment(ApprovalStatus::Rejected, 0.0));
+        assert_eq!(d.signal, Signal::Hold);
+        assert_eq!(d.amount, 0.0);
+    }
+
+    #[test]
+    fn adjusted_clamps_amount() {
+        let mut d = decision(Signal::Buy, 1.0);
+        enforce(&mut d, &assessment(ApprovalStatus::Adjusted, 0.3));
+        assert_eq!(d.signal, Signal::Buy);
+        assert!((d.amount - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn close_is_not_clamped() {
+        let mut d = decision(Signal::Close, 0.0);
+        enforce(&mut d, &assessment(ApprovalStatus::Adjusted, 0.3));
+        assert_eq!(d.signal, Signal::Close);
+    }
+
+    #[test]
+    fn zero_budget_blocks_new_position() {
+        let mut d = decision(Signal::Sell, 1.0);
+        enforce(&mut d, &assessment(ApprovalStatus::Approved, 0.0));
+        assert_eq!(d.signal, Signal::Hold);
     }
 }

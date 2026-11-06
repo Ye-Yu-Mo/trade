@@ -52,6 +52,10 @@ cargo run --release -- backtest --strategy llm --max-bars 200
 # 查看全部回测参数
 cargo run --release -- backtest --help
 
+# Walk-forward 样本外回测
+cargo run --release -- walkforward --symbols BTCUSDT,ETHUSDT --interval 1h \
+  --start 2025-01-01 --end 2025-06-01
+
 # 启动只读 Dashboard（另开一个终端）
 cargo run --release -- dashboard --port 8080
 # 或随交易循环一起启动

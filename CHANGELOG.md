@@ -2,6 +2,22 @@
 
 所有值得注意的变更都记录在这里。版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased] — v0.7.0
+
+### Added
+
+- **Walk-forward 样本外回测**（`src/walkforward.rs`）
+  - 滚动切分训练 / 测试窗口，训练段遍历 fast/slow 网格选参，测试段只使用没见过的数据
+  - 多标的等权组合，输出单标的与组合的 OOS 收益、回撤、Sharpe、胜率和买入持有对照
+  - 新增 `trade walkforward` 子命令，报告写入 JSON + 组合权益曲线 CSV
+- SMA 策略支持任意 fast/slow 周期（直接从K线窗口计算）
+- 回测引擎拆出 `run_segment`，可对任意K线片段复用
+- 训练窗口的最后一笔成交不再越界到测试窗口第一根K线
+
+### Changed
+
+- `compute_metrics` 改为接收买入持有收益，减少参数耦合
+
 ## [Unreleased] — v0.6.0
 
 ### Added

@@ -14,6 +14,7 @@ mod risk;
 mod state;
 mod strategy;
 mod types;
+mod walkforward;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -785,6 +786,7 @@ async fn main() -> Result<()> {
         cli::Command::Run(args) => run_live(args).await,
         cli::Command::Backtest(args) => cli::run_backtest(*args).await,
         cli::Command::Dashboard(args) => cli::run_dashboard(args).await,
+        cli::Command::Walkforward(args) => cli::run_walkforward(args).await,
     }
 }
 

@@ -253,6 +253,45 @@ All endpoints are read-only GETs:
 
 There is no authentication. **Do not bind it to `0.0.0.0` on a public network.**
 
+## Walk-Forward Backtesting
+
+A single-range backtest overfits. Walk-forward picks parameters on a rolling training window and
+evaluates them only on the next unseen window:
+
+```bash
+cargo run --release -- walkforward \
+  --symbols BTCUSDT,ETHUSDT --interval 1h \
+  --start 2025-01-01 --end 2025-06-01 \
+  --train-bars 720 --test-bars 240 \
+  --fast 5,10,20 --slow 20,50,100
+```
+
+```text
+================ Walk-forward 结果 ================
+训练 720 根 / 测试 240 根 | fast=[5, 10, 20] slow=[20, 50, 100] | 成本 0.050% + 2.0bps
+---------------------------------------------------
+标的              OOS收益      买入持有      最大回撤   Sharpe      交易      胜率
+BTCUSDT        -6.45%   +11.49%     7.52%    -2.22     166   33.1%
+ETHUSDT        -8.39%    -5.77%     8.83%    -1.77     256   33.6%
+---------------------------------------------------
+组合(等权)         -7.42%    +2.86%     7.54%    -2.28     422   33.4%
+窗口数: 11 | 组合期末权益: 9258.09 USDT
+===================================================
+```
+
+How it works:
+
+- Each window trains on `train-bars` and is scored on the following `test-bars`, then rolls forward
+  by `test-bars`.
+- The training pass tries every valid `fast < slow` pair and picks the best by
+  `return - 0.5 × drawdown`.
+- The chosen pair is evaluated once on the test window; only out-of-sample equity is chained.
+- Multiple symbols run independently with equal initial capital; the portfolio row is the sum.
+- Reports go to `backtest/walkforward_<timestamp>.json` plus a portfolio equity CSV.
+
+This is deliberately a **hard** benchmark. A simple SMA rule losing to buy-and-hold out-of-sample is
+a valid and useful result.
+
 ## Multi-Agent Decision Process
 
 ### Phase 1: Parallel Market Analysis
@@ -414,6 +453,7 @@ src/
 ├── dashboard.rs     Read-only monitoring server (axum)
 ├── dashboard.html   Single-page dashboard (no build step)
 ├── backtest.rs      Paper broker, backtest engine, metrics
+├── walkforward.rs   Rolling train/test evaluation and portfolio aggregation
 ├── strategy.rs      Pluggable strategies: SMA cross, LLM baseline
 ├── risk.rs          Deterministic stops, circuit breakers, risk state
 ├── data.rs          Historical K-line download and local cache

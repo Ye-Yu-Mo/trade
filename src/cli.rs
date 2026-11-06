@@ -7,7 +7,8 @@ use crate::backtest::{self, BacktestConfig};
 use crate::dashboard;
 use crate::data;
 use crate::strategy::Strategy;
-use anyhow::{anyhow, bail, Result};
+use crate::walkforward::{self, WalkForwardConfig};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::env;
@@ -34,6 +35,8 @@ pub enum Command {
     Backtest(Box<BacktestArgs>),
     /// 启动只读 Dashboard（读取 logs/ 与 backtest/）
     Dashboard(DashboardArgs),
+    /// Walk-forward 样本外回测，支持多标的
+    Walkforward(WalkForwardArgs),
 }
 
 #[derive(Debug, Args, Default)]
@@ -64,6 +67,81 @@ pub struct DashboardArgs {
     /// 回测结果目录
     #[arg(long, default_value = "backtest")]
     pub backtest_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct WalkForwardArgs {
+    /// 标的列表，逗号分隔
+    #[arg(long, default_value = "BTCUSDT,ETHUSDT")]
+    pub symbols: String,
+
+    /// K线周期
+    #[arg(long, default_value = "1h")]
+    pub interval: String,
+
+    /// 开始时间；默认结束时间前 365 天
+    #[arg(long)]
+    pub start: Option<String>,
+
+    /// 结束时间；默认当前时间
+    #[arg(long)]
+    pub end: Option<String>,
+
+    /// 每个训练窗口的K线数量
+    #[arg(long, default_value_t = 720)]
+    pub train_bars: usize,
+
+    /// 每个测试窗口的K线数量，同时也是滚动步长
+    #[arg(long, default_value_t = 240)]
+    pub test_bars: usize,
+
+    /// fast 均线候选，逗号分隔
+    #[arg(long, default_value = "5,10,20")]
+    pub fast: String,
+
+    /// slow 均线候选，逗号分隔
+    #[arg(long, default_value = "20,50,100")]
+    pub slow: String,
+
+    /// 初始资金（多标的时等权分配）
+    #[arg(long, default_value_t = 10_000.0)]
+    pub initial_balance: f64,
+
+    /// 每次开仓占当前权益的比例
+    #[arg(long, default_value_t = 0.2)]
+    pub position_pct: f64,
+
+    /// 杠杆倍数
+    #[arg(long, default_value_t = 1.0)]
+    pub leverage: f64,
+
+    /// 单边手续费（bps）
+    #[arg(long, default_value_t = 5.0)]
+    pub fee_bps: f64,
+
+    /// 滑点（bps）
+    #[arg(long, default_value_t = 2.0)]
+    pub slippage_bps: f64,
+
+    /// 止损
+    #[arg(long, default_value_t = 0.02)]
+    pub stop_loss_pct: f64,
+
+    /// 止盈
+    #[arg(long, default_value_t = 0.05)]
+    pub take_profit_pct: f64,
+
+    /// 指标预热K线数（会自动不小于最大 slow + 5）
+    #[arg(long, default_value_t = 120)]
+    pub warmup: usize,
+
+    /// K线缓存目录
+    #[arg(long, default_value = "data/klines")]
+    pub data_dir: PathBuf,
+
+    /// 报告输出目录
+    #[arg(long, default_value = "backtest")]
+    pub out_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -141,26 +219,31 @@ pub struct BacktestArgs {
     pub out_dir: PathBuf,
 }
 
-pub async fn run_backtest(args: BacktestArgs) -> Result<()> {
-    let mut end_ms = match &args.end {
+fn resolve_range(
+    start: &Option<String>,
+    end: &Option<String>,
+    interval: &str,
+    lookback_days: i64,
+) -> Result<(i64, i64)> {
+    let mut end_ms = match end {
         Some(value) => data::parse_time(value)?,
         None => Utc::now().timestamp_millis(),
     };
 
-    // 默认结束时间对齐到K线边界，避免每次运行都生成新的缓存键
-    let step = data::interval_millis(&args.interval);
-    if args.end.is_none() {
+    // 默认时间对齐到K线边界，避免每次运行都生成新的缓存键
+    let step = data::interval_millis(interval);
+    if end.is_none() {
         if let Some(step) = step {
             end_ms = end_ms / step * step;
         }
     }
 
-    let mut start_ms = match &args.start {
+    let mut start_ms = match start {
         Some(value) => data::parse_time(value)?,
-        None => end_ms - DEFAULT_LOOKBACK_DAYS * 24 * 3600 * 1000,
+        None => end_ms - lookback_days * 24 * 3600 * 1000,
     };
 
-    if args.start.is_none() {
+    if start.is_none() {
         if let Some(step) = step {
             start_ms = start_ms / step * step;
         }
@@ -169,6 +252,17 @@ pub async fn run_backtest(args: BacktestArgs) -> Result<()> {
     if start_ms >= end_ms {
         bail!("开始时间必须早于结束时间");
     }
+
+    Ok((start_ms, end_ms))
+}
+
+pub async fn run_backtest(args: BacktestArgs) -> Result<()> {
+    let (start_ms, end_ms) = resolve_range(
+        &args.start,
+        &args.end,
+        &args.interval,
+        DEFAULT_LOOKBACK_DAYS,
+    )?;
 
     let strategy = match args.strategy {
         StrategyArg::Sma => Strategy::sma_cross(),
@@ -218,4 +312,64 @@ pub async fn run_dashboard(args: DashboardArgs) -> Result<()> {
         },
     )
     .await
+}
+
+fn parse_usize_list(input: &str, label: &str) -> Result<Vec<usize>> {
+    let values: Vec<usize> = input
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .with_context(|| format!("{} 参数无效: {}", label, value))
+        })
+        .collect::<Result<_>>()?;
+
+    if values.is_empty() {
+        bail!("{} 不能为空", label);
+    }
+    Ok(values)
+}
+
+pub async fn run_walkforward(args: WalkForwardArgs) -> Result<()> {
+    let symbols: Vec<String> = args
+        .symbols
+        .split(',')
+        .map(str::trim)
+        .filter(|symbol| !symbol.is_empty())
+        .map(|symbol| symbol.to_string())
+        .collect();
+
+    if symbols.is_empty() {
+        bail!("--symbols 不能为空");
+    }
+
+    let fasts = parse_usize_list(&args.fast, "--fast")?;
+    let slows = parse_usize_list(&args.slow, "--slow")?;
+    let (start_ms, end_ms) = resolve_range(&args.start, &args.end, &args.interval, 365)?;
+
+    let config = WalkForwardConfig {
+        symbols,
+        interval: args.interval,
+        start_ms,
+        end_ms,
+        train_bars: args.train_bars,
+        test_bars: args.test_bars,
+        warmup: args.warmup,
+        fasts,
+        slows,
+        initial_balance: args.initial_balance,
+        position_pct: args.position_pct,
+        leverage: args.leverage,
+        fee_rate: args.fee_bps / 10_000.0,
+        slippage_bps: args.slippage_bps,
+        stop_loss_pct: args.stop_loss_pct,
+        take_profit_pct: args.take_profit_pct,
+        data_dir: args.data_dir,
+        out_dir: args.out_dir,
+    };
+
+    walkforward::run(config).await?;
+    Ok(())
 }

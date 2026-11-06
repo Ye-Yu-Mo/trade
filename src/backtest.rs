@@ -279,12 +279,19 @@ impl PaperBroker {
     }
 }
 
-pub async fn run(cfg: BacktestConfig, mut strategy: Strategy) -> Result<BacktestResult> {
+#[derive(Debug, Clone)]
+pub struct SegmentRequest<'a> {
+    pub klines: &'a [Kline],
+    /// 第一根参与决策的K线索引，必须满足 start_index + 1 >= warmup
+    pub start_index: usize,
+    /// 最后一根可作为“下一根成交”的K线索引（含）
+    pub end_index: usize,
+    pub initial_equity: f64,
+}
+
+pub async fn run(cfg: BacktestConfig, strategy: Strategy) -> Result<BacktestResult> {
     if cfg.warmup < 5 {
         bail!("warmup 至少为 5 根K线");
-    }
-    if cfg.position_pct <= 0.0 || cfg.position_pct > 1.0 {
-        bail!("position_pct 必须在 (0, 1] 之间");
     }
 
     let klines = data::load_klines(
@@ -296,32 +303,84 @@ pub async fn run(cfg: BacktestConfig, mut strategy: Strategy) -> Result<Backtest
     )
     .await?;
 
-    let warmup = cfg.warmup;
-    if klines.len() < warmup + 2 {
+    if klines.len() < cfg.warmup + 2 {
         bail!(
             "K线数量不足：需要至少 {} 根（warmup {} + 2），实际 {} 根",
-            warmup + 2,
-            warmup,
+            cfg.warmup + 2,
+            cfg.warmup,
             klines.len()
         );
     }
 
     let last_index = match cfg.max_bars {
-        Some(n) => (warmup - 1 + n.max(1)).min(klines.len() - 1),
+        Some(n) => (cfg.warmup - 1 + n.max(1)).min(klines.len() - 1),
         None => klines.len() - 1,
     };
 
-    let mut broker = PaperBroker::new(cfg.initial_balance, cfg.fee_rate, cfg.slippage_bps);
+    let mut strategy = strategy;
+    let result = run_segment(
+        &cfg,
+        &mut strategy,
+        &SegmentRequest {
+            klines: &klines,
+            start_index: cfg.warmup - 1,
+            end_index: last_index,
+            initial_equity: cfg.initial_balance,
+        },
+    )
+    .await?;
+
+    persist(&result)?;
+    print_report(&result);
+
+    Ok(result)
+}
+
+/// 在给定的一段K线上运行回测，不读盘、不落盘、不打印。
+/// walk-forward 复用它来评估训练窗口和测试窗口。
+pub async fn run_segment(
+    cfg: &BacktestConfig,
+    strategy: &mut Strategy,
+    req: &SegmentRequest<'_>,
+) -> Result<BacktestResult> {
+    if cfg.warmup < 5 {
+        bail!("warmup 至少为 5 根K线");
+    }
+    if cfg.position_pct <= 0.0 || cfg.position_pct > 1.0 {
+        bail!("position_pct 必须在 (0, 1] 之间");
+    }
+    if req.initial_equity <= 0.0 {
+        bail!("初始权益必须为正");
+    }
+    if req.start_index + 1 < cfg.warmup {
+        bail!(
+            "start_index {} 之前没有足够的预热K线（warmup {}）",
+            req.start_index,
+            cfg.warmup
+        );
+    }
+    if req.end_index <= req.start_index || req.end_index >= req.klines.len() {
+        bail!(
+            "回测区间无效: start_index={}, end_index={}, bars={}",
+            req.start_index,
+            req.end_index,
+            req.klines.len()
+        );
+    }
+
+    let klines = req.klines;
+    let warmup = cfg.warmup;
+    let mut broker = PaperBroker::new(req.initial_equity, cfg.fee_rate, cfg.slippage_bps);
     let mut equity_curve = vec![EquityPoint {
-        time: klines[warmup - 1].timestamp,
-        datetime: format_time(klines[warmup - 1].timestamp),
-        equity: cfg.initial_balance,
-        price: klines[warmup - 1].close,
+        time: klines[req.start_index].timestamp,
+        datetime: format_time(klines[req.start_index].timestamp),
+        equity: req.initial_equity,
+        price: klines[req.start_index].close,
         position: None,
     }];
     let mut liquidated = false;
 
-    for i in (warmup - 1)..last_index {
+    for i in req.start_index..req.end_index {
         let window = &klines[i + 1 - warmup..=i];
         let indicators = market::calculate_indicators(window)?;
         let current_price = klines[i].close;
@@ -395,7 +454,7 @@ pub async fn run(cfg: BacktestConfig, mut strategy: Strategy) -> Result<Backtest
         }
     }
 
-    let last_bar = &klines[last_index];
+    let last_bar = &klines[req.end_index];
     if !liquidated && broker.position.is_some() {
         broker.close(last_bar.close, last_bar.timestamp, "回测结束，强制平仓")?;
         if let Some(point) = equity_curve.last_mut() {
@@ -404,39 +463,39 @@ pub async fn run(cfg: BacktestConfig, mut strategy: Strategy) -> Result<Backtest
         }
     }
 
+    let first_close = klines[req.start_index].close;
+    let last_close = klines[req.end_index].close;
+    let buy_and_hold_pct = if first_close > 0.0 {
+        (last_close - first_close) / first_close * 100.0
+    } else {
+        0.0
+    };
+
     let metrics = compute_metrics(
-        &cfg,
-        &klines,
-        warmup,
-        last_index,
+        req.initial_equity,
+        &cfg.interval,
+        buy_and_hold_pct,
         &broker,
         &equity_curve,
         liquidated,
     );
 
-    let result = BacktestResult {
-        config: cfg,
+    Ok(BacktestResult {
+        config: cfg.clone(),
         metrics,
         trades: broker.fills,
         equity_curve,
-    };
-
-    persist(&result)?;
-    print_report(&result);
-
-    Ok(result)
+    })
 }
 
 fn compute_metrics(
-    cfg: &BacktestConfig,
-    klines: &[Kline],
-    warmup: usize,
-    last_index: usize,
+    initial_equity: f64,
+    interval: &str,
+    buy_and_hold_pct: f64,
     broker: &PaperBroker,
     equity_curve: &[EquityPoint],
     liquidated: bool,
 ) -> Metrics {
-    let initial_equity = cfg.initial_balance;
     let final_equity = equity_curve
         .last()
         .map(|p| p.equity)
@@ -448,15 +507,7 @@ fn compute_metrics(
         0.0
     };
 
-    let first_close = klines[warmup - 1].close;
-    let last_close = klines[last_index].close;
-    let buy_and_hold_return_pct = if first_close > 0.0 {
-        (last_close - first_close) / first_close * 100.0
-    } else {
-        0.0
-    };
-
-    let (max_drawdown_pct, sharpe) = drawdown_and_sharpe(equity_curve, &cfg.interval);
+    let (max_drawdown_pct, sharpe) = drawdown_and_sharpe(equity_curve, interval);
 
     let closed: Vec<f64> = broker.fills.iter().filter_map(|f| f.pnl).collect();
     let wins: Vec<f64> = closed.iter().copied().filter(|p| *p > 0.0).collect();
@@ -491,7 +542,7 @@ fn compute_metrics(
         initial_equity,
         final_equity,
         total_return_pct,
-        buy_and_hold_return_pct,
+        buy_and_hold_return_pct: buy_and_hold_pct,
         max_drawdown_pct,
         sharpe,
         trade_count,
@@ -506,7 +557,7 @@ fn compute_metrics(
     }
 }
 
-fn drawdown_and_sharpe(equity_curve: &[EquityPoint], interval: &str) -> (f64, f64) {
+pub(crate) fn drawdown_and_sharpe(equity_curve: &[EquityPoint], interval: &str) -> (f64, f64) {
     let mut peak = f64::MIN;
     let mut max_dd = 0.0;
 
@@ -816,19 +867,8 @@ mod tests {
         b.execute(Signal::Sell, 110.0, 3, 0.5, 1.0, "l").unwrap();
         b.close(120.0, 4, "loss").unwrap();
 
-        let cfg = test_config();
-        let klines: Vec<Kline> = (0..200)
-            .map(|i| Kline {
-                timestamp: i,
-                open: 100.0,
-                high: 101.0,
-                low: 99.0,
-                close: 100.0,
-                volume: 1.0,
-            })
-            .collect();
         let curve = vec![point(1, 10_000.0), point(2, b.cash)];
-        let m = compute_metrics(&cfg, &klines, 120, 199, &b, &curve, false);
+        let m = compute_metrics(10_000.0, "1h", 0.0, &b, &curve, false);
 
         assert_eq!(m.trade_count, 2);
         assert!((m.win_rate_pct - 50.0).abs() < 1e-9);
@@ -842,27 +882,6 @@ mod tests {
             equity,
             price: 100.0,
             position: None,
-        }
-    }
-
-    fn test_config() -> BacktestConfig {
-        BacktestConfig {
-            symbol: "BTCUSDT".into(),
-            interval: "1h".into(),
-            start_ms: 0,
-            end_ms: 1,
-            strategy: "test".into(),
-            initial_balance: 10_000.0,
-            position_pct: 0.5,
-            leverage: 1.0,
-            fee_rate: 0.0005,
-            slippage_bps: 0.0,
-            stop_loss_pct: 0.5,
-            take_profit_pct: 1.0,
-            warmup: 120,
-            data_dir: "data".into(),
-            out_dir: "backtest".into(),
-            max_bars: None,
         }
     }
 

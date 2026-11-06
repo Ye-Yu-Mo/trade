@@ -45,7 +45,11 @@ pub enum Strategy {
 
 impl Strategy {
     pub fn sma_cross() -> Self {
-        Strategy::SmaCross(SmaCrossStrategy)
+        Strategy::SmaCross(SmaCrossStrategy::default())
+    }
+
+    pub fn sma_cross_with(fast: usize, slow: usize) -> Self {
+        Strategy::SmaCross(SmaCrossStrategy::new(fast, slow))
     }
 
     pub fn llm(api_key: String) -> Self {
@@ -72,12 +76,29 @@ impl Strategy {
 // 用途：不依赖 API key，任何人 clone 下来就能跑回测，
 // 也是衡量 LLM 策略是否有超额收益的对照组。
 
-pub struct SmaCrossStrategy;
+pub struct SmaCrossStrategy {
+    pub fast: usize,
+    pub slow: usize,
+}
+
+impl Default for SmaCrossStrategy {
+    fn default() -> Self {
+        Self { fast: 5, slow: 20 }
+    }
+}
 
 impl SmaCrossStrategy {
+    pub fn new(fast: usize, slow: usize) -> Self {
+        Self { fast, slow }
+    }
+
     fn decide(&self, ctx: &BarContext<'_>) -> Direction {
-        let fast = ctx.indicators.sma_5;
-        let slow = ctx.indicators.sma_20;
+        let Some(fast) = sma(ctx.window, self.fast) else {
+            return Direction::hold(format!("{} 周期均线数据不足", self.fast));
+        };
+        let Some(slow) = sma(ctx.window, self.slow) else {
+            return Direction::hold(format!("{} 周期均线数据不足", self.slow));
+        };
 
         if slow.abs() < f64::EPSILON {
             return Direction::hold("均线数据不可用");
@@ -98,7 +119,10 @@ impl SmaCrossStrategy {
                 Direction {
                     signal: Signal::Close,
                     confidence: Confidence::Low,
-                    reason: format!("SMA5/SMA20 粘合（{:.2}%），平仓观望", gap_pct),
+                    reason: format!(
+                        "SMA{}/SMA{} 粘合（{:.2}%），平仓观望",
+                        self.fast, self.slow, gap_pct
+                    ),
                 }
             } else {
                 Direction::hold("均线粘合，无趋势")
@@ -110,18 +134,32 @@ impl SmaCrossStrategy {
                 signal: Signal::Buy,
                 confidence,
                 reason: format!(
-                    "SMA5 {:.2} 高于 SMA20 {:.2}（+{:.2}%）",
-                    fast, slow, gap_pct
+                    "SMA{} {:.2} 高于 SMA{} {:.2}（+{:.2}%）",
+                    self.fast, fast, self.slow, slow, gap_pct
                 ),
             }
         } else {
             Direction {
                 signal: Signal::Sell,
                 confidence,
-                reason: format!("SMA5 {:.2} 低于 SMA20 {:.2}（{:.2}%）", fast, slow, gap_pct),
+                reason: format!(
+                    "SMA{} {:.2} 低于 SMA{} {:.2}（{:.2}%）",
+                    self.fast, fast, self.slow, slow, gap_pct
+                ),
             }
         }
     }
+}
+
+fn sma(window: &[Kline], period: usize) -> Option<f64> {
+    if period == 0 || window.len() < period {
+        return None;
+    }
+    let sum: f64 = window[window.len() - period..]
+        .iter()
+        .map(|k| k.close)
+        .sum();
+    Some(sum / period as f64)
 }
 
 // ========== LLM 单智能体基线 ==========
@@ -222,12 +260,12 @@ mod tests {
     use super::*;
     use crate::types::{Position, PositionSide, TechnicalIndicators};
 
-    fn indicators(sma_5: f64, sma_20: f64) -> TechnicalIndicators {
+    fn indicators() -> TechnicalIndicators {
         TechnicalIndicators {
-            sma_5,
-            sma_20,
-            sma_50: sma_20,
-            sma_100: sma_20,
+            sma_5: 100.0,
+            sma_20: 100.0,
+            sma_50: 100.0,
+            sma_100: 100.0,
             price_change_1: 0.0,
             price_change_3: 0.0,
             price_change_6: 0.0,
@@ -236,6 +274,21 @@ mod tests {
             atr_percent: 0.0,
             volume_ratio: 1.0,
         }
+    }
+
+    fn bars(closes: &[f64]) -> Vec<Kline> {
+        closes
+            .iter()
+            .enumerate()
+            .map(|(i, &close)| Kline {
+                timestamp: i as i64,
+                open: close,
+                high: close,
+                low: close,
+                close,
+                volume: 1.0,
+            })
+            .collect()
     }
 
     fn context_with<'a>(
@@ -260,85 +313,79 @@ mod tests {
 
     #[test]
     fn golden_cross_is_buy() {
-        let ind = indicators(101.0, 100.0);
-        let bars = vec![Kline {
-            timestamp: 0,
-            open: 100.0,
-            high: 101.0,
-            low: 99.0,
-            close: 100.0,
-            volume: 1.0,
-        }];
-        let ctx = context(&bars, &ind);
-        let dir = SmaCrossStrategy.decide(&ctx);
+        let closes: Vec<f64> = (1..=20).map(|v| v as f64).collect();
+        let window = bars(&closes);
+        let ind = indicators();
+        let ctx = context(&window, &ind);
+        let dir = SmaCrossStrategy::default().decide(&ctx);
         assert_eq!(dir.signal, Signal::Buy);
         assert_eq!(dir.confidence, Confidence::High);
     }
 
     #[test]
     fn death_cross_is_sell() {
-        let ind = indicators(99.0, 100.0);
-        let bars = vec![Kline {
-            timestamp: 0,
-            open: 100.0,
-            high: 101.0,
-            low: 99.0,
-            close: 100.0,
-            volume: 1.0,
-        }];
-        let ctx = context(&bars, &ind);
-        let dir = SmaCrossStrategy.decide(&ctx);
-        assert_eq!(dir.signal, Signal::Sell);
+        let closes: Vec<f64> = (1..=20).rev().map(|v| v as f64).collect();
+        let window = bars(&closes);
+        let ind = indicators();
+        let ctx = context(&window, &ind);
+        assert_eq!(
+            SmaCrossStrategy::default().decide(&ctx).signal,
+            Signal::Sell
+        );
     }
 
     #[test]
     fn tiny_gap_without_position_holds() {
-        let ind = indicators(100.02, 100.0);
-        let bars = vec![Kline {
-            timestamp: 0,
-            open: 100.0,
-            high: 101.0,
-            low: 99.0,
-            close: 100.0,
-            volume: 1.0,
-        }];
-        let ctx = context(&bars, &ind);
-        assert_eq!(SmaCrossStrategy.decide(&ctx).signal, Signal::Hold);
+        let window = bars(&[100.0; 20]);
+        let ind = indicators();
+        let ctx = context(&window, &ind);
+        assert_eq!(
+            SmaCrossStrategy::default().decide(&ctx).signal,
+            Signal::Hold
+        );
     }
 
     #[test]
     fn tiny_gap_with_position_closes_to_flat() {
-        let ind = indicators(100.02, 100.0);
-        let bars = vec![Kline {
-            timestamp: 0,
-            open: 100.0,
-            high: 101.0,
-            low: 99.0,
-            close: 100.0,
-            volume: 1.0,
-        }];
+        let window = bars(&[100.0; 20]);
+        let ind = indicators();
         let position = Position {
             side: PositionSide::Long,
             amount: 1.0,
             entry_price: 100.0,
             unrealized_pnl: 0.0,
         };
-        let ctx = context_with(&bars, &ind, Some(&position));
-        assert_eq!(SmaCrossStrategy.decide(&ctx).signal, Signal::Close);
+        let ctx = context_with(&window, &ind, Some(&position));
+        assert_eq!(
+            SmaCrossStrategy::default().decide(&ctx).signal,
+            Signal::Close
+        );
     }
 
     #[test]
     fn missing_sma_means_hold() {
-        let ind = indicators(100.0, 0.0);
-        let bars = vec![Kline {
-            timestamp: 0,
-            open: 100.0,
-            high: 101.0,
-            low: 99.0,
-            close: 100.0,
-            volume: 1.0,
-        }];
-        let ctx = context(&bars, &ind);
-        assert_eq!(SmaCrossStrategy.decide(&ctx).signal, Signal::Hold);
+        let window = bars(&[100.0; 10]);
+        let ind = indicators();
+        let ctx = context(&window, &ind);
+        assert_eq!(
+            SmaCrossStrategy::default().decide(&ctx).signal,
+            Signal::Hold
+        );
+    }
+
+    #[test]
+    fn custom_periods_work() {
+        let closes: Vec<f64> = (1..=20).map(|v| v as f64).collect();
+        let window = bars(&closes);
+        let ind = indicators();
+        let ctx = context(&window, &ind);
+        assert_eq!(
+            SmaCrossStrategy::new(3, 10).decide(&ctx).signal,
+            Signal::Buy
+        );
+        assert_eq!(
+            SmaCrossStrategy::new(3, 30).decide(&ctx).signal,
+            Signal::Hold
+        );
     }
 }

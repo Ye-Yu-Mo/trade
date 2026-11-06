@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; width: 1280px; height: 640px; overflow: hidden; }
+  body {
+    background: #0b0e14;
+    color: #e7ebf2;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif;
+    position: relative;
+    padding: 62px 72px;
+  }
+  .grid {
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px);
+    background-size: 48px 48px;
+    mask-image: radial-gradient(circle at 70% 40%, #000 0%, transparent 75%);
+  }
+  .glow {
+    position: absolute; width: 760px; height: 760px; right: -220px; top: -300px;
+    background: radial-gradient(circle, rgba(91,140,255,.22), transparent 65%);
+  }
+  .content { position: relative; z-index: 2; display: flex; flex-direction: column; height: 100%; }
+  .eyebrow { color: #5b8cff; font-size: 18px; letter-spacing: .18em; font-weight: 700; }
+  h1 { font-size: 62px; line-height: 1.06; margin: 18px 0 14px; letter-spacing: -.02em; }
+  h1 span { color: #8a94a6; }
+  .sub { color: #8a94a6; font-size: 23px; margin-bottom: 26px; }
+  .chips { display: flex; gap: 10px; }
+  .chip {
+    border: 1px solid #2a3446; background: #111722; color: #cfd6e4;
+    padding: 7px 14px; border-radius: 999px; font-size: 15px;
+  }
+  .bottom { margin-top: auto; display: flex; align-items: flex-end; justify-content: space-between; }
+  .url { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #8a94a6; font-size: 16px; }
+  .note { color: #8a94a6; font-size: 15px; }
+  .note b { color: #f85149; font-weight: 600; }
+
+  .panel {
+    position: absolute; right: 72px; top: 132px; width: 452px;
+    background: rgba(17,23,34,.92); border: 1px solid #1e2735; border-radius: 18px;
+    padding: 22px 24px;
+    box-shadow: 0 24px 60px rgba(0,0,0,.45);
+  }
+  .panel h2 { margin: 0 0 4px; font-size: 14px; color: #8a94a6; font-weight: 500; letter-spacing: .06em; }
+  .panel .cap { color: #5c6678; font-size: 11px; margin-bottom: 18px; }
+  .row { display: flex; align-items: center; justify-content: space-between; padding: 11px 0; border-bottom: 1px solid #1a2230; }
+  .row:last-child { border-bottom: 0; }
+  .row .name { font-size: 15px; color: #cfd6e4; }
+  .row .val { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 20px; font-weight: 600; }
+  .neg { color: #f85149; }
+  .pos { color: #3fb950; }
+  .neutral { color: #8a94a6; }
+
+  .spark { position: absolute; right: 72px; top: 500px; width: 452px; height: 70px; opacity: .9; }
+</style>
+</head>
+<body>
+<div class="grid"></div>
+<div class="glow"></div>
+<div class="content">
+  <div class="eyebrow">RUST · DEEPSEEK · BINANCE</div>
+  <h1>LLM 多智能体<br><span>交易框架</span></h1>
+  <div class="sub">可回测 · 可复现 · 可验证，而不是又一张收益截图</div>
+  <div class="chips">
+    <span class="chip">零 key Demo</span>
+    <span class="chip">Agent Trace</span>
+    <span class="chip">Walk-forward</span>
+    <span class="chip">确定性风控</span>
+  </div>
+  <div class="bottom">
+    <div>
+      <div class="url">github.com/Ye-Yu-Mo/trade</div>
+      <div class="note" style="margin-top:8px">先用 <span class="url">cargo run --release -- demo</span> 看到结果，再谈策略。</div>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>样本外基准</h2>
+  <div class="cap">BTC + ETH · 6 个月 · 同成本 walk-forward</div>
+  <div class="row"><span class="name">SMA walk-forward</span><span class="val neg">-7.42%</span></div>
+  <div class="row"><span class="name">Random (p=0.05)</span><span class="val pos">+0.17%</span></div>
+  <div class="row"><span class="name">Buy &amp; hold</span><span class="val pos">+2.76%</span></div>
+  <div class="row"><span class="name">Buy &amp; hold 最大回撤</span><span class="val neutral">37.4%</span></div>
+</div>
+
+<svg class="spark" viewBox="0 0 452 70" preserveAspectRatio="none">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5b8cff" stop-opacity=".35"/>
+      <stop offset="1" stop-color="#5b8cff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <path d="M0,52 L28,48 L52,55 L78,40 L104,44 L130,33 L156,38 L182,26 L208,31 L234,20 L260,27 L286,18 L312,24 L338,14 L364,20 L390,10 L416,16 L452,8 L452,70 L0,70 Z" fill="url(#g)"/>
+  <path d="M0,52 L28,48 L52,55 L78,40 L104,44 L130,33 L156,38 L182,26 L208,31 L234,20 L260,27 L286,18 L312,24 L338,14 L364,20 L390,10 L416,16 L452,8" fill="none" stroke="#5b8cff" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>
+</body>
+</html>
